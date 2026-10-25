@@ -7,16 +7,18 @@ import type { Ref } from "react";
  */
 export function GlassBackdrop({
   className = "popover-backdrop",
+  blur = true,
   ref,
 }: {
   className?: string;
+  blur?: boolean;
   ref?: Ref<HTMLDivElement>;
 }) {
   return (
     <div
       ref={ref}
       aria-hidden="true"
-      className={`pointer-events-none absolute inset-0 z-0 rounded-[inherit] backdrop-blur-xl ${className}`}
+      className={`pointer-events-none absolute inset-0 z-0 rounded-[inherit] ${blur ? "backdrop-blur-xl" : ""} ${className}`}
     />
   );
 }

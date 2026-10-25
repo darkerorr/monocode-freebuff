@@ -40,6 +40,7 @@ import {
   getActiveFreebuffSessionId,
   listFreebuffModels,
   selectFreebuffModel,
+  startFreebuffSession,
 } from "../../../integrations/harness/providers/freebuff/freebuff";
 import {
   filterQuickModels,
@@ -53,6 +54,8 @@ type Props = {
   onChange: (model: AgentModel) => void;
   onSettingsChange: (values: Record<string, string>) => void;
   onClose: () => void;
+  sessionId?: string;
+  cwd?: string;
 };
 
 /** Inline model browser: providers share the full width above search/results. */
@@ -63,6 +66,8 @@ export function QuickModelSelector({
   onChange,
   onSettingsChange,
   onClose,
+  sessionId: preferredSessionId,
+  cwd,
 }: Props) {
   const catalogVersion = useSyncExternalStore(
     subscribeModels,
@@ -107,22 +112,35 @@ export function QuickModelSelector({
       : modelsFor(visibleTab);
   const models = filterQuickModels(pool, query);
   const refreshFreebuffModels = useCallback(() => {
-    const sessionId = getActiveFreebuffSessionId();
+    const requestSessionId = preferredSessionId ?? getActiveFreebuffSessionId();
+    const targetSessionId = requestSessionId ?? (cwd ? crypto.randomUUID() : null);
     setFreebuffModelError(null);
     setFreebuffListError(null);
     setFreebuffModels(null);
-    if (!sessionId) {
-      setFreebuffSessionId(null);
-      setFreebuffListError("No active Freebuff session. Start one in MonoCode to read its /model choices.");
-      return;
+    if (!targetSessionId) {
+      setFreebuffSessionId(null);        setFreebuffListError("No active Freebuff session. Open the picker from a project session to start one and read its /model choices.");
+        return;
+
     }
-    setFreebuffSessionId(sessionId);
+    setFreebuffSessionId(targetSessionId);
     setFreebuffListLoading(true);
-    void listFreebuffModels(sessionId)
+    const start = requestSessionId && !cwd
+      ? Promise.resolve()
+      : cwd
+        ? startFreebuffSession({
+          sessionId: targetSessionId,
+          cwd,
+          model: FREEBUFF_SESSION_MODEL.id,
+          runtimeMode: "supervised",
+          onEvent: () => undefined,
+        })
+        : Promise.reject(new Error("Select a project before starting Freebuff."));
+    void start
+      .then(() => listFreebuffModels(targetSessionId))
       .then(setFreebuffModels)
       .catch((error: unknown) => setFreebuffListError(error instanceof Error ? error.message : String(error)))
       .finally(() => setFreebuffListLoading(false));
-  }, []);
+  }, [preferredSessionId, cwd]);
 
   useEffect(() => {
     if (visibleTab === "freebuff") refreshFreebuffModels();

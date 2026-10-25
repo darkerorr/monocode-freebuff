@@ -2,8 +2,10 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { FreebuffChatSnapshot } from "../../core/child";
 import {
   resetFreebuffForTests,
+  getActiveFreebuffSessionId,
   listFreebuffModels,
   selectFreebuffModel,
+  startFreebuffSession,
   sendFreebuffTurn,
   setFreebuffRuntimeForTests,
   stopFreebuffSession,
@@ -89,6 +91,33 @@ afterEach(async () => {
 });
 
 describe("Freebuff interactive model control", () => {
+  it("starts without a prompt and reuses the ready PTY when the first message arrives", async () => {
+    const probe = makeRuntime();
+    setFreebuffRuntimeForTests(probe.runtime);
+    const events: string[] = [];
+    const input = {
+      sessionId: "freebuff-control-session",
+      cwd: "/repo",
+      model: "freebuff:session",
+      runtimeMode: "supervised" as const,
+      onEvent: (event: { type: string }) => events.push(event.type),
+    };
+
+    await startFreebuffSession(input);
+    expect(getActiveFreebuffSessionId(input.sessionId)).toBe(input.sessionId);
+    expect(probe.writes).toEqual([]);
+    expect(events).toEqual([]);
+
+    const firstTurnEvents: string[] = [];
+    await sendFreebuffTurn({
+      ...input,
+      text: "",
+      onEvent: (event) => firstTurnEvents.push(event.type),
+    });
+    expect(firstTurnEvents).toEqual(["session.providerBound", "session.started"]);
+    expect(getActiveFreebuffSessionId(input.sessionId)).toBe(input.sessionId);
+  });
+
   it("uses the observed /model row, confirms each movement and the active footer", async () => {
     const probe = makeRuntime();
     setFreebuffRuntimeForTests(probe.runtime);

@@ -77,6 +77,7 @@ type Live = {
   resolvedArgs: string[];
   modelControlTail: string;
   modelControlBusy: boolean;
+  startedNotified: boolean;
   screen: Terminal;
 };
 
@@ -125,6 +126,7 @@ const defaultRuntime: FreebuffRuntime = {
 let runtime: FreebuffRuntime = defaultRuntime;
 
 const liveByThread = new Map<string, Live>();
+const startupByThread = new Map<string, Promise<Live>>();
 const resumeByThread = new Map<string, Resume>();
 const cancelledThreads = new Set<string>();
 const OUTPUT_TAIL_CHARS = 32_000;
@@ -373,6 +375,11 @@ export function getActiveFreebuffSessionId(preferredSessionId?: string): string 
   return sessions[sessions.length - 1]?.sessionId ?? null;
 }
 
+/** Start the provider PTY through the same single-flight lifecycle used by sends. */
+export function startFreebuffSession(input: HarnessSessionInput): Promise<void> {
+  return ensureLive(input).then(() => undefined);
+}
+
 /** Read model choices from the real /model screen of a running Freebuff PTY. */
 export function listFreebuffModels(sessionId: string): Promise<FreebuffModel[]> {
   if (!sessionId || !liveByThread.has(sessionId)) {
@@ -430,6 +437,7 @@ export function resetFreebuffForTests(): void {
     live.turn?.resolve();
   }
   liveByThread.clear();
+  startupByThread.clear();
   resumeByThread.clear();
   cancelledThreads.clear();
   modelControlSubscriberCount = 0;
@@ -471,6 +479,11 @@ export async function sendFreebuffTurn(input: SendTurnInput): Promise<void> {
     return;
   }
   live.onEvent = input.onEvent;
+  if (!live.startedNotified) {
+    live.startedNotified = true;
+    input.onEvent({ type: "session.providerBound", providerSessionId: live.chatId });
+    input.onEvent({ type: "session.started" });
+  }
   await runTurn(live, input);
 }
 
@@ -490,6 +503,7 @@ export async function cancelFreebuffTurn(sessionId: string): Promise<void> {
     return;
   }
   liveByThread.delete(sessionId);
+  startupByThread.delete(sessionId);
   live.screen.dispose();
   live.cancelled = true;
   live.bootReject?.(new FreebuffCancelledError());
@@ -502,6 +516,7 @@ export async function cancelFreebuffTurn(sessionId: string): Promise<void> {
 export async function stopFreebuffSession(sessionId: string): Promise<void> {
   const live = liveByThread.get(sessionId);
   liveByThread.delete(sessionId);
+  startupByThread.delete(sessionId);
   cancelledThreads.delete(sessionId);
   if (!live) {
     await runtime.kill(sessionId).catch(() => undefined);
@@ -549,7 +564,37 @@ export function respondFreebuffQuestion(
   // Same as approvals: questions are rendered by Freebuff itself.
 }
 
-async function ensureLive(input: HarnessSessionInput): Promise<Live> {
+function ensureLive(input: HarnessSessionInput): Promise<Live> {
+  const existing = liveByThread.get(input.sessionId);
+  if (
+    existing &&
+    existing.cwd === input.cwd &&
+    existing.exited === undefined &&
+    !existing.cancelled &&
+    !existing.stopping
+  ) {
+    existing.onEvent = input.onEvent;
+    return Promise.resolve(existing);
+  }
+  const pending = startupByThread.get(input.sessionId);
+  if (pending) {
+    return pending.then((live) => {
+      live.onEvent = input.onEvent;
+      return live;
+    });
+  }
+  const startup = Promise.resolve().then(() => ensureLiveOnce(input));
+  startupByThread.set(input.sessionId, startup);
+  const clearStartup = () => {
+    if (startupByThread.get(input.sessionId) === startup) {
+      startupByThread.delete(input.sessionId);
+    }
+  };
+  void startup.then(clearStartup, clearStartup);
+  return startup;
+}
+
+async function ensureLiveOnce(input: HarnessSessionInput): Promise<Live> {
   const existing = liveByThread.get(input.sessionId);
   if (
     existing &&
@@ -594,6 +639,7 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
     output: "",
     modelControlTail: "",
     modelControlBusy: false,
+    startedNotified: false,
     screen: new Terminal({ cols: 120, rows: 40, scrollback: 0 }),
     cancelled: false,
     stopping: false,
@@ -653,8 +699,6 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
 
   resumeByThread.set(input.sessionId, { chatId, cwd: input.cwd });
   ensureModelControlSubscription();
-  live.onEvent({ type: "session.providerBound", providerSessionId: chatId });
-  live.onEvent({ type: "session.started" });
   return live;
 }
 

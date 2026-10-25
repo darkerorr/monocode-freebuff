@@ -30,6 +30,74 @@ const MAX_TOOL_OUTPUT_CHARS: usize = 16_000;
 const TERMINAL_ROWS: u16 = 40;
 const TERMINAL_COLS: u16 = 120;
 
+#[cfg(windows)]
+fn freebuff_pty_command(command: &str, args: &[String]) -> (String, Vec<String>) {
+    let lower = command.to_ascii_lowercase();
+    if !lower.ends_with(".cmd") && !lower.ends_with(".bat") {
+        return (command.to_string(), args.to_vec());
+    }
+
+    // npm installs on Windows expose Freebuff as a `.cmd` shim. CreateProcessW
+    // cannot launch that shell script directly; run it via cmd.exe so its Node
+    // launcher can start the bundled Freebuff terminal binary.
+    let inner_command = std::iter::once(format!("\"{}\"", command))
+        .chain(args.iter().map(|argument| windows_cmd_argument(argument)))
+        .collect::<Vec<_>>()
+        .join(" ");
+    // /S requires one outer quote pair around the /C command string when the
+    // batch path itself is quoted (the canonical form is: cmd /s /c ""path" args").
+    let command_line = format!("\"{inner_command}\"");
+    (
+        "cmd.exe".to_string(),
+        vec!["/D".into(), "/S".into(), "/C".into(), command_line],
+    )
+}
+
+#[cfg(windows)]
+fn windows_cmd_argument(argument: &str) -> String {
+    if argument.contains([' ', '\t', '"']) {
+        format!("\"{}\"", argument.replace('"', "\\\""))
+    } else {
+        argument.to_string()
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_launch_tests {
+    use super::freebuff_pty_command;
+
+    #[test]
+    fn runs_npm_cmd_shim_through_cmd_with_original_cli_arguments() {
+        let command = r"C:\Users\ROOT\AppData\Roaming\npm\freebuff.cmd";
+        let args = vec![
+            "--cwd".to_string(),
+            r"C:\Users\ROOT\Music\monocode".to_string(),
+            "--continue".to_string(),
+            "2026-10-25T00-13-03.784Z".to_string(),
+        ];
+
+        let (program, wrapped_args) = freebuff_pty_command(command, &args);
+
+        assert_eq!(program, "cmd.exe");
+        assert_eq!(wrapped_args[..3], ["/D", "/S", "/C"]);
+        assert_eq!(
+            wrapped_args[3],
+            format!("\"\"{command}\" --cwd \"{}\" --continue {}\"", args[1], args[3])
+        );
+    }
+
+    #[test]
+    fn keeps_native_executable_and_arguments_unchanged() {
+        let command = r"C:\Program Files\Freebuff\freebuff.exe";
+        let args = vec!["--continue".to_string(), "chat-id".to_string()];
+
+        assert_eq!(
+            freebuff_pty_command(command, &args),
+            (command.to_string(), args)
+        );
+    }
+}
+
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct FreebuffPtyData {
@@ -590,8 +658,9 @@ mod pty {
                 pixel_height: 0,
             })
             .map_err(|error| format!("Failed to open Freebuff terminal: {error}"))?;
-        let mut builder = CommandBuilder::new(command);
-        builder.args(args);
+        let (program, child_args) = freebuff_pty_command(command, args);
+        let mut builder = CommandBuilder::new(program);
+        builder.args(child_args);
         builder.cwd(workdir);
         builder.env("PATH", crate::harness::gui_search_path());
         builder.env("TERM", "xterm-256color");
@@ -606,6 +675,7 @@ mod pty {
             builder.env("FREEBUFF_CONFIG_DIR", config_dir);
         }
         crate::harness::prepare_pty_builder(&mut builder, command);
+        builder.env("PATHEXT", ".COM;.EXE;.BAT;.CMD");
         let writer = pair
             .master
             .take_writer()

@@ -803,6 +803,7 @@ export function QuickComposer({ onShown }: { onShown: () => void }) {
               }}
               onSettingsChange={setModelSettings}
               onClose={closePicker}
+              cwd={cwd ?? undefined}
             />
           ) : null}
 

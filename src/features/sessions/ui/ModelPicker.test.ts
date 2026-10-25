@@ -101,6 +101,7 @@ vi.mock("../../../shared/ui/Popover", () => ({
     side?: string;
     "aria-label"?: string;
     "data-model-picker"?: boolean;
+    noBackdropBlur?: boolean;
   }) =>
     createElement(
       "div",
@@ -123,6 +124,7 @@ vi.mock("../../../shared/ui/Popover", () => ({
         "data-side": props.side,
         "aria-label": props["aria-label"],
         "data-model-picker": props["data-model-picker"] ? "" : undefined,
+        "data-no-backdrop-blur": props.noBackdropBlur ? "true" : undefined,
       },
       children,
     ),
@@ -332,6 +334,7 @@ describe("model picker", () => {
     const modelFlyout = container.querySelector<HTMLElement>(
       '[role="dialog"][aria-label="Models"]',
     )!;
+    expect(modelFlyout.dataset.noBackdropBlur).toBe("true");
     expect(modelFlyout.style.height).toBe("476px");
     expect(modelFlyout.dataset.minHeight).toBe("478");
     expect(modelFlyout.dataset.maxHeight).toBe("478");

@@ -50,6 +50,8 @@ type Props = Omit<ComponentPropsWithoutRef<"div">, "style"> & {
   layer?: number;
   /** Drops the glass frame and keeps only placement and the content animation. */
   bare?: boolean;
+  /** Keeps the glass tint but skips backdrop-filter for solid surfaces. */
+  noBackdropBlur?: boolean;
   /** Corner radius of the glass frame. Defaults to `rounded-xl`. */
   rounded?: string;
   style?: CSSProperties;
@@ -209,6 +211,7 @@ function NativePopover({
     constrainHeight: _constrainHeight,
     layer: _layer,
     bare: _bare,
+    noBackdropBlur: _noBackdropBlur,
     rounded: _rounded,
     ...rest
   } = props;
@@ -241,6 +244,7 @@ function WebPopover({
   constrainHeight = true,
   layer: requestedLayer,
   bare = false,
+  noBackdropBlur = false,
   rounded = "rounded-xl",
   className,
   style,
@@ -366,7 +370,7 @@ function WebPopover({
       style={{ ...placed, zIndex: layer }}
       className={bare ? undefined : `${FRAME} ${rounded}`}
     >
-      {bare ? null : <GlassBackdrop />}
+      {bare ? null : <GlassBackdrop blur={!noBackdropBlur} />}
       <div
         {...rest}
         ref={(el) => {

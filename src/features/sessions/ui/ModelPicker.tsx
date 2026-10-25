@@ -56,6 +56,7 @@ import {
   getActiveFreebuffSessionId,
   listFreebuffModels,
   selectFreebuffModel,
+  startFreebuffSession,
 } from "../../../integrations/harness/providers/freebuff/freebuff";
 import { HARNESSES, HARNESS_TITLE, type HarnessId } from "../model/session";
 import { useLockOverscroll } from "../../../shared/hooks/useLockOverscroll";
@@ -336,11 +337,13 @@ function useFreebuffAccount(): FreebuffAccountSnapshot {
 function FreebuffSessionContent({
   currentId,
   preferredSessionId,
+  cwd,
   available,
   onPick,
 }: {
   currentId: string;
   preferredSessionId?: string;
+  cwd?: string;
   available: boolean;
   onPick: (model: AgentModel) => void;
 }) {
@@ -351,26 +354,56 @@ function FreebuffSessionContent({
   const [loadingModels, setLoadingModels] = useState(false);
   const [controlSessionId, setControlSessionId] = useState<string | null>(null);
   const [models, setModels] = useState<FreebuffAccountSnapshot["models"]["value"]>(null);
+  const requestId = useRef(0);
 
   const refreshModels = useCallback(() => {
-    const targetSessionId = getActiveFreebuffSessionId(preferredSessionId);
+    const request = ++requestId.current;
     setModelError(null);
     setModelListError(null);
     setModels(null);
-    if (!targetSessionId) {
-      setControlSessionId(null);
-      setModelListError("No active Freebuff session. Start one in MonoCode to read its /model choices.");
-      return;
-    }
-    setControlSessionId(targetSessionId);
     setLoadingModels(true);
-    void listFreebuffModels(targetSessionId)
-      .then((nextModels) => setModels(nextModels))
+    setControlSessionId(preferredSessionId ?? null);
+    const start = async () => {
+      if (!cwd) {
+        const activeSessionId = getActiveFreebuffSessionId(preferredSessionId);
+        if (activeSessionId) return activeSessionId;
+        throw new Error(
+          "Open this picker from a project session to start Freebuff and load its /model choices.",
+        );
+      }
+      if (!available && !getActiveFreebuffSessionId(preferredSessionId)) {
+        throw new Error(
+          "Freebuff is unavailable for this project. Enable the provider to start its session.",
+        );
+      }
+      const sessionId = preferredSessionId ?? getActiveFreebuffSessionId();
+      if (!sessionId) {
+        throw new Error("No MonoCode session is available to own the Freebuff terminal.");
+      }
+      await startFreebuffSession({
+        sessionId,
+        cwd,
+        model: FREEBUFF_SESSION_MODEL.id,
+        runtimeMode: "supervised",
+        onEvent: () => undefined,
+      });
+      return sessionId;
+    };
+    void start()
+      .then((sessionId) => listFreebuffModels(sessionId).then((nextModels) => {
+        if (request !== requestId.current) return;
+        setControlSessionId(sessionId);
+        setModels(nextModels);
+      }))
       .catch((error: unknown) => {
+        if (request !== requestId.current) return;
+        setControlSessionId(null);
         setModelListError(error instanceof Error ? error.message : String(error));
       })
-      .finally(() => setLoadingModels(false));
-  }, [preferredSessionId]);
+      .finally(() => {
+        if (request === requestId.current) setLoadingModels(false);
+      });
+  }, [preferredSessionId, cwd, available]);
 
   useEffect(() => {
     refreshModels();
@@ -382,14 +415,13 @@ function FreebuffSessionContent({
       <div className="mt-2 flex items-center justify-between gap-2">
         <p className="text-[11px] leading-relaxed text-content/45">
           Models are read live from Freebuff&apos;s own <code>/model</code> picker.
-        </p>        <button
+        </p>
+        <button
           type="button"
           aria-label="Refresh Freebuff models"
           title="Refresh Freebuff models"
           disabled={!available || loadingModels || changingModel}
           onMouseDown={(event) => event.preventDefault()}
-
-
           onClick={refreshModels}
           className="grid size-7 shrink-0 place-items-center rounded-md text-content/45 hover:bg-content/5 disabled:opacity-40"
         >
@@ -404,7 +436,10 @@ function FreebuffSessionContent({
         </p>
       ) : null}
       {models?.length ? (
-        <div className="mt-2 flex flex-wrap gap-1.5" aria-label="Available Freebuff models">
+        <div
+          className="mt-2 flex flex-wrap gap-1.5"
+          aria-label="Available Freebuff models"
+        >
           {models.map((item) => (
             <button
               key={item.name}
@@ -437,7 +472,9 @@ function FreebuffSessionContent({
               className="rounded-md border border-content/10 px-2 py-1 text-[11px] text-content/70 hover:bg-content/5 disabled:opacity-40"
               title={item.descriptors.join(" · ") || undefined}
             >
-              {item.name}{item.effort ? ` · ${item.effort}` : ""}{item.selected ? " (current)" : ""}
+              {item.name}
+              {item.effort ? ` · ${item.effort}` : ""}
+              {item.selected ? " (current)" : ""}
             </button>
           ))}
         </div>
@@ -1064,6 +1101,7 @@ function CatalogModelPicker({
         <ModelFlyout
           anchor={button}
           preferredFreebuffSessionId={sessionId}
+          cwd={project}
           side={side}
           autoFocusSearch
           onDismiss={(reason) => dismiss(reason === "escape")}
@@ -1263,6 +1301,7 @@ function CatalogModelPicker({
             <ModelFlyout
               anchor={activeRow}
               preferredFreebuffSessionId={sessionId}
+              cwd={project}
               autoFocusSearch
               harnesses={pickerHarnesses}
               tab={visibleTab}
@@ -1738,6 +1777,7 @@ function SelectPill({
 function ModelFlyout({
   anchor,
   preferredFreebuffSessionId,
+  cwd,
   side = "right",
   autoFocusSearch = false,
   onDismiss,
@@ -1757,6 +1797,7 @@ function ModelFlyout({
 }: {
   anchor: HTMLButtonElement | { current: HTMLButtonElement | null };
   preferredFreebuffSessionId?: string;
+  cwd?: string;
   side?: "right" | "top" | "bottom";
   autoFocusSearch?: boolean;
   onDismiss?: (reason: "outside" | "escape") => void;
@@ -1866,7 +1907,8 @@ function ModelFlyout({
       // Popover caps the height to the viewport; a fixed max here would
       // clip the bottom rows (and tabs) out of reach on short or zoomed windows.
       style={{ height: MODEL_MENU_HEIGHT }}
-      className="flex min-h-0 overflow-hidden font-sans"
+      className="flex min-h-0 overflow-hidden bg-background-base font-sans"
+      noBackdropBlur
     >
       <nav
         role="tablist"
@@ -1922,6 +1964,7 @@ function ModelFlyout({
             <FreebuffSessionContent
               currentId={currentId}
               preferredSessionId={preferredFreebuffSessionId}
+              cwd={cwd}
               available={source.available("freebuff")}
               onPick={onPick}
             />
