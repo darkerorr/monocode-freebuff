@@ -255,6 +255,7 @@ import {
   useProviderAccountIdentities,
 } from "../../providers/model/providerAccountIdentity";
 import { ProviderAccountSubtitle } from "../../providers/ui/ProviderAccountSubtitle";
+import { FreebuffAccountPanel } from "../../providers/ui/FreebuffAccountPanel";
 import {
   saveComposerAutocorrect,
   savePacedReveal,
@@ -3548,6 +3549,8 @@ function ProvidersPage({
           );
         })}
       </Group>
+
+      {isHarnessAvailable("freebuff") ? <FreebuffAccountPanel /> : null}
 
       <Group title="Advanced">
         <Row

@@ -26,7 +26,8 @@ export type HarnessId =
   | "fx"
   | "hermes"
   | "antigravity"
-  | "devin";
+  | "devin"
+  | "freebuff";
 
 export const HARNESSES: HarnessId[] = [
   "claude",
@@ -40,6 +41,7 @@ export const HARNESSES: HarnessId[] = [
   "hermes",
   "antigravity",
   "devin",
+  "freebuff",
 ];
 
 export type BlockRole =
@@ -550,6 +552,7 @@ export const HARNESS_LABEL: Record<HarnessId, string> = {
   hermes: "hermes",
   antigravity: "antigravity",
   devin: "devin",
+  freebuff: "freebuff",
 };
 
 export const HARNESS_TITLE: Record<HarnessId, string> = {
@@ -564,11 +567,15 @@ export const HARNESS_TITLE: Record<HarnessId, string> = {
   hermes: "Hermes Agent",
   antigravity: "Antigravity",
   devin: "Devin",
+  freebuff: "Freebuff",
 };
 
-/** fx ACP rejects attachment prompt blocks. */
+/**
+ * fx ACP rejects attachment prompt blocks. Freebuff's terminal UI has no
+ * attachment channel MonoCode could drive, so files are not offered there.
+ */
 export function harnessSupportsAttachments(id: HarnessId): boolean {
-  return id !== "fx";
+  return id !== "fx" && id !== "freebuff";
 }
 
 export function newSession(

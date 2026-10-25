@@ -14,6 +14,7 @@ mod cursor_store;
 mod devin_config;
 mod devin_usage;
 mod external_editor;
+mod freebuff;
 mod fs;
 mod gitlab;
 mod harness;
@@ -277,6 +278,7 @@ pub fn run() {
         })
         .manage(harness::HarnessHost::new())
         .manage(pty::PtyHost::new())
+        .manage(freebuff::FreebuffPtyHost::new())
         .manage(remote::RemoteConnections::default())
         .manage(window_transfer::WindowTransferState::new())
         .setup(|app| {
@@ -501,6 +503,7 @@ pub fn run() {
             harness::harness_resolve_grok,
             harness::harness_resolve_hermes,
             harness::harness_resolve_devin,
+            harness::harness_resolve_freebuff,
             harness::harness_resolve_antigravity,
             harness::harness_free_port,
             harness::harness_spawn,
@@ -525,6 +528,12 @@ pub fn run() {
             rate_limits::fetch_opencode_go_usage,
             devin_usage::fetch_devin_usage,
             pty::pty_spawn,
+            freebuff::harness_freebuff_prepare_chat,
+            freebuff::harness_freebuff_read_chat,
+            freebuff::harness_freebuff_pty_spawn,
+            freebuff::harness_freebuff_pty_write,
+            freebuff::harness_freebuff_pty_kill,
+            freebuff::harness_freebuff_pty_kill_all,
             pty::pty_write,
             pty::pty_resize,
             pty::pty_status,
@@ -719,6 +728,9 @@ fn reap_harness_children(handle: &tauri::AppHandle) {
         host.kill_all();
     }
     if let Some(host) = handle.try_state::<pty::PtyHost>() {
+        host.kill_all();
+    }
+    if let Some(host) = handle.try_state::<freebuff::FreebuffPtyHost>() {
         host.kill_all();
     }
 }

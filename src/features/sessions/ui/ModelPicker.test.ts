@@ -15,6 +15,71 @@ vi.mock("../../../integrations/harness/core/registry", () => ({
   refreshHarnessCatalogs: () => Promise.resolve(),
 }));
 
+const freebuffAccountMock = vi.hoisted(() => {
+  type ActiveModel = { name: string; effort: string } | null;
+  const listeners = new Set<() => void>();
+  const empty = {
+    state: "unknown",
+    value: null,
+    reason: null,
+    source: "Freebuff terminal",
+    checkedAt: null,
+  };
+  let snapshot = {
+    version: empty,
+    signedIn: empty,
+    plan: empty,
+    dailyHours: empty,
+    sessionLeftMinutes: empty,
+    context: empty,
+    model: { ...empty, value: null as ActiveModel },
+    models: empty,
+    modelControl: empty,
+    contextCapacity: empty,
+    accountTokens: empty,
+    resetsAt: empty,
+    checkedAt: null,
+    probing: false,
+    error: null,
+  };
+  return {
+    read: () => snapshot,
+    subscribe: (listener: () => void) => {
+      listeners.add(listener);
+      return () => listeners.delete(listener);
+    },
+    setModel: (value: ActiveModel) => {
+      snapshot = {
+        ...snapshot,
+        model: {
+          ...snapshot.model,
+          value,
+          state: value ? "available" : "unknown",
+        },
+      };
+      for (const listener of listeners) listener();
+    },
+    setModels: (value: Array<{ name: string; effort: string | null; descriptors: string[]; selected: boolean }> | null) => {
+      snapshot = {
+        ...snapshot,
+        models: { ...snapshot.models, value, state: value ? "available" : "unavailable" },
+      };
+      for (const listener of listeners) listener();
+    },
+    reset: () => {
+      snapshot = {
+        ...snapshot,
+        model: { ...snapshot.model, value: null, state: "unknown" },
+      };
+    },
+  };
+});
+
+vi.mock("../../providers/model/freebuffAccount", () => ({
+  getFreebuffAccountSnapshot: freebuffAccountMock.read,
+  subscribeFreebuffAccount: freebuffAccountMock.subscribe,
+}));
+
 vi.mock("../../../shared/ui/Popover", () => ({
   Popover: ({
     children,
@@ -65,6 +130,7 @@ vi.mock("../../../shared/ui/Popover", () => ({
 
 import { ModelControlPills, ModelPicker } from "./ModelPicker";
 import {
+  FREEBUFF_SESSION_MODEL,
   resetHarnessModelOverlays,
   saveRecentModelChoice,
   setHarnessModels,
@@ -77,6 +143,7 @@ beforeEach(() => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   localStorage.clear();
   resetHarnessModelOverlays();
+  freebuffAccountMock.reset();
   container = document.createElement("div");
   document.body.append(container);
   root = createRoot(container);
@@ -128,6 +195,105 @@ function inputText(input: HTMLInputElement, value: string) {
 }
 
 describe("model picker", () => {
+  it("opens the Freebuff tab from another provider, shows CLI-owned session content, and selects its stable session id", async () => {
+    const onChange = vi.fn();
+    act(() =>
+      root.render(
+        createElement(ModelPicker, {
+          harness: "claude",
+          model: "claude:opus-5",
+          values: {},
+          onChange,
+          onSettingsChange: vi.fn(),
+        }),
+      ),
+    );
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    const trigger = container.querySelector<HTMLButtonElement>(
+      'button[aria-haspopup="menu"]',
+    )!;
+    act(() => trigger.click());
+    const modelRow = [
+      ...container.querySelectorAll<HTMLButtonElement>("button"),
+    ].find((button) => button.textContent?.startsWith("Model"))!;
+    hover(modelRow);
+    const freebuffTab = container.querySelector<HTMLButtonElement>(
+      '[role="tab"][aria-label="Freebuff"]',
+    )!;
+    act(() => freebuffTab.click());
+
+    expect(freebuffTab.getAttribute("aria-selected")).toBe("true");
+    expect(container.textContent).toContain("Models are read live from Freebuff's own /model picker.");
+    expect(container.textContent).not.toContain("No matching models");
+    const select = [
+      ...container.querySelectorAll<HTMLButtonElement>("button"),
+    ].find((button) =>
+      button.textContent?.includes("Use Freebuff for this session"),
+    )!;
+    act(() => select.click());
+    expect(onChange).toHaveBeenCalledWith(
+      "freebuff",
+      FREEBUFF_SESSION_MODEL.id,
+    );
+  });
+
+  it("shows a detected Freebuff model while keeping other providers on their normal catalog trigger", async () => {
+    freebuffAccountMock.setModel({ name: "GPT-6.1 Sol", effort: "high" });
+    const onChange = vi.fn();
+    act(() =>
+      root.render(
+        createElement(ModelPicker, {
+          harness: "freebuff",
+          model: FREEBUFF_SESSION_MODEL.id,
+          values: {},
+          onChange,
+          onSettingsChange: vi.fn(),
+        }),
+      ),
+    );
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    const trigger = container.querySelector<HTMLButtonElement>(
+      'button[aria-haspopup="dialog"]',
+    )!;
+    expect(trigger.textContent).toContain("GPT-6.1 Sol");
+    expect(trigger.textContent).toContain("high");
+    expect(trigger.getAttribute("aria-label")).toContain("GPT-6.1 Sol");
+
+    act(() => trigger.click());
+    const freebuffPanel = container.querySelector<HTMLElement>(
+      '[role="dialog"][aria-label="Models"]',
+    )!;
+    const freebuffTab = freebuffPanel.querySelector<HTMLButtonElement>(
+      '[role="tab"][aria-label="Freebuff"]',
+    )!;
+    act(() => freebuffTab.click());
+    expect(freebuffPanel.textContent).toContain("GPT-6.1 Sol");
+    expect(freebuffPanel.textContent).not.toContain("No matching models");
+
+    act(() =>
+      root.render(
+        createElement(ModelPicker, {
+          harness: "grok",
+          model: "grok:grok-4.6",
+          values: { effort: "high" },
+          onChange,
+          onSettingsChange: vi.fn(),
+        }),
+      ),
+    );
+    expect(
+      container.querySelector('button[aria-haspopup="menu"]')?.textContent,
+    ).toContain("Grok 4.6");
+  });
+
   it("shows the model name and effort in the combined picker", () => {
     const onChange = vi.fn();
     const onSettingsChange = vi.fn();
@@ -166,9 +332,9 @@ describe("model picker", () => {
     const modelFlyout = container.querySelector<HTMLElement>(
       '[role="dialog"][aria-label="Models"]',
     )!;
-    expect(modelFlyout.style.height).toBe("440px");
-    expect(modelFlyout.dataset.minHeight).toBe("442");
-    expect(modelFlyout.dataset.maxHeight).toBe("442");
+    expect(modelFlyout.style.height).toBe("476px");
+    expect(modelFlyout.dataset.minHeight).toBe("478");
+    expect(modelFlyout.dataset.maxHeight).toBe("478");
     expect(
       container.querySelector('[role="tablist"][aria-orientation="vertical"]'),
     ).not.toBeNull();
@@ -476,13 +642,11 @@ describe("model picker", () => {
     const options = [
       ...container.querySelectorAll<HTMLButtonElement>('[role="option"]'),
     ];
-    expect(options.map((option) => option.getAttribute("aria-label"))).toEqual(
-      [
-        "Claude Sonnet 5, Anthropic",
-        "Claude Opus 5, Anthropic",
-        "Claude Sonnet 5, GitHub Copilot",
-      ],
-    );
+    expect(options.map((option) => option.getAttribute("aria-label"))).toEqual([
+      "Claude Sonnet 5, Anthropic",
+      "Claude Opus 5, Anthropic",
+      "Claude Sonnet 5, GitHub Copilot",
+    ]);
     // The next row down is the next visible row, not the next catalog entry.
     options[0].focus();
     keyDown(options[0], "ArrowDown");

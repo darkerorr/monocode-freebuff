@@ -17,6 +17,15 @@ it("resolves every provider and runs only allowed provider commands", async () =
   );
   try {
     for (const provider of REMOTE_PROVIDERS) {
+      if (provider === "freebuff") {
+        // Freebuff's only interface is a terminal UI, which needs the desktop
+        // PTY; the headless host must report it unavailable instead of
+        // advertising a provider it cannot drive.
+        await expect(
+          backend.invoke(`harness_resolve_${provider}`),
+        ).rejects.toThrow(/desktop app/);
+        continue;
+      }
       const resolved = await backend.invoke<{ path: string; args?: string[] }>(
         `harness_resolve_${provider}`,
       );

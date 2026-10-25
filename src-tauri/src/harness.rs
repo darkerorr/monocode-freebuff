@@ -877,6 +877,19 @@ pub fn harness_resolve_devin() -> Result<CursorBinary, String> {
         })
 }
 
+/// Resolve the Freebuff CLI used by the interactive terminal UI.
+#[tauri::command(async)]
+pub fn harness_resolve_freebuff() -> Result<CursorBinary, String> {
+    resolve_freebuff()
+        .map(|path| CursorBinary {
+            path: path.to_string_lossy().into_owned(),
+        })
+        .ok_or_else(|| {
+            "Freebuff CLI not found. Install it with `npm i -g freebuff`, sign in with `freebuff login`, then retry."
+                .into()
+        })
+}
+
 /// Antigravity's ACP server is separate from the interactive agy CLI.
 #[tauri::command(async)]
 pub fn harness_resolve_antigravity() -> Result<AntigravityBinary, String> {
@@ -1615,7 +1628,7 @@ fn is_text_file_busy(error: &std::io::Error) -> bool {
     error.raw_os_error() == Some(libc::ETXTBSY)
 }
 
-fn terminate(pid: u32) {
+pub(crate) fn terminate(pid: u32) {
     terminate_after(pid, KILL_ESCALATE);
 }
 
@@ -1840,6 +1853,7 @@ fn is_harness_argv_token(part: &str) -> bool {
             | "fx"
             | "hermes"
             | "devin"
+            | "freebuff"
             | "agy_acp_server.par"
             | "pi"
             | "worker-server"
@@ -2081,6 +2095,7 @@ fn resolve_harness_binary_default(provider: &str) -> Option<PathBuf> {
         "hermes" => resolve_hermes(),
         "antigravity" => resolve_antigravity(),
         "devin" => resolve_devin(),
+        "freebuff" => resolve_freebuff(),
         _ => None,
     }
 }
@@ -2127,6 +2142,7 @@ fn resolve_harness_binary_override(provider: &str, binary_path: &str) -> Result<
         "hermes" => &["hermes"],
         "antigravity" => &["agy_acp_server.par"],
         "devin" => &["devin"],
+        "freebuff" => &["freebuff"],
         _ => {
             return Err(format!(
                 "Unsupported configured harness provider: {provider}"
@@ -2513,6 +2529,31 @@ fn resolve_devin() -> Option<PathBuf> {
     candidates.push(PathBuf::from("/usr/local/bin/devin"));
     candidates.push(PathBuf::from("/usr/bin/devin"));
     if let Some(from_shell) = which_via_login_shell("devin") {
+        candidates.push(from_shell);
+    }
+
+    first_binary(candidates)
+}
+
+fn resolve_freebuff() -> Option<PathBuf> {
+    let home = dirs_home().map(PathBuf::from);
+    let mut candidates = Vec::new();
+
+    if let Some(home) = &home {
+        candidates.push(home.join(".local/bin/freebuff"));
+        candidates.push(home.join(".npm-global/bin/freebuff"));
+        candidates.push(home.join(".bun/bin/freebuff"));
+        candidates.push(home.join("n/bin/freebuff"));
+    }
+    #[cfg(windows)]
+    if let Some(app_data) = std::env::var_os("APPDATA").map(PathBuf::from) {
+        candidates.push(app_data.join("npm/freebuff"));
+    }
+    #[cfg(target_os = "macos")]
+    candidates.push(PathBuf::from("/opt/homebrew/bin/freebuff"));
+    candidates.push(PathBuf::from("/usr/local/bin/freebuff"));
+    candidates.push(PathBuf::from("/usr/bin/freebuff"));
+    if let Some(from_shell) = which_via_login_shell("freebuff") {
         candidates.push(from_shell);
     }
 
@@ -3012,6 +3053,49 @@ fn prepare_child(cmd: &mut Command, command: &str) {
         apply_grok_env(cmd);
     }
     isolate_child(cmd);
+}
+
+#[cfg(unix)]
+pub(crate) fn prepare_pty_child(cmd: &mut Command, command: &str) {
+    // Freebuff sets up its own controlling terminal with setsid() in pre_exec.
+    // Do not use isolate_child here: process_group(0) would make the child a
+    // group leader first, causing setsid() to fail with EPERM.
+    apply_gui_env(cmd);
+    if command_basename(command) == "fx" {
+        apply_fx_env(cmd);
+    }
+    if command_basename(command) == "grok" {
+        apply_grok_env(cmd);
+    }
+    crate::background_work::configure_child(cmd);
+    cmd.env(HARNESS_PARENT_ENV, std::process::id().to_string());
+}
+
+#[cfg(windows)]
+pub(crate) fn prepare_pty_builder(builder: &mut portable_pty::CommandBuilder, command: &str) {
+    builder.env(HARNESS_PARENT_ENV, std::process::id().to_string());
+    if command_basename(command) == "fx" {
+        for key in [
+            "AI_GATEWAY_API_KEY",
+            "FX_AI_GATEWAY_API_KEY",
+            "VERCEL_OIDC_TOKEN",
+        ] {
+            if std::env::var_os(key).is_none() {
+                if let Some(value) = login_shell_env(key) {
+                    builder.env(key, value);
+                }
+            }
+        }
+    }
+    if command_basename(command) == "grok" {
+        for key in ["XAI_API_KEY", "GROK_CODE_XAI_API_KEY"] {
+            if std::env::var_os(key).is_none() {
+                if let Some(value) = login_shell_env(key) {
+                    builder.env(key, value);
+                }
+            }
+        }
+    }
 }
 
 /// fx keeps its Gateway credential in the macOS Keychain and reads it by

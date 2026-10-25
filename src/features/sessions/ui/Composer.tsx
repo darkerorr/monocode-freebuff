@@ -2403,6 +2403,7 @@ export function Composer({
                   values={modelSettings}
                   allowedHarnesses={allowedModelHarnesses}
                   project={cwd}
+                  sessionId={sessionId}
                   hideSettings={controlsBeside}
                   hotkeys={hotkeys && enabled}
                   onChange={onModelChange}

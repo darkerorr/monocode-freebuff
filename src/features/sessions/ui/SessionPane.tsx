@@ -1236,6 +1236,7 @@ const LocalSessionPane = memo(function LocalSessionPane({
                           values={session.modelSettings}
                           allowedHarnesses={allowedModelHarnesses}
                           project={workCwd}
+                          sessionId={session.id}
                           hideSettings
                           hotkeys={focused && !btw.open}
                           variant="text"

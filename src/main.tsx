@@ -91,32 +91,60 @@ void listen("quit_aborted", () => {
   abortQuit();
 });
 
-void Promise.all([
-  homeDirPrimed,
-  providerBinaryPathsPrimed,
-  loadBootWorkspace(),
-  appLoaded,
-]).then(
-  ([
-    ,
-    ,
-    { windowTransfer, resumed, history, historyCwd },
-    { default: App },
-  ]) => {
-    performance.mark("monocode:workspace-ready");
-    const installedUpdate = windowTransfer ? null : consumeInstalledUpdate();
-    ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
-      <React.StrictMode>
-        <BootGate>
-          <App
-            windowTransfer={windowTransfer}
-            resumed={resumed}
-            installedUpdate={installedUpdate}
-            history={history}
-            historyCwd={historyCwd}
-          />
-        </BootGate>
-      </React.StrictMode>,
-    );
+const root = document.getElementById("root");
+if (!root) throw new Error("MonoCode could not find its application root.");
+const reactRoot = ReactDOM.createRoot(root);
+
+function renderWorkspace(
+  boot: Awaited<ReturnType<typeof loadBootWorkspace>>,
+  App: (typeof import("./app/App"))["default"],
+) {
+  performance.mark("monocode:workspace-ready");
+  const installedUpdate = boot.windowTransfer ? null : consumeInstalledUpdate();
+  reactRoot.render(
+    <React.StrictMode>
+      <BootGate>
+        <App
+          windowTransfer={boot.windowTransfer}
+          resumed={boot.resumed}
+          installedUpdate={installedUpdate}
+          history={boot.history}
+          historyCwd={boot.historyCwd}
+        />
+      </BootGate>
+    </React.StrictMode>,
+  );
+}
+
+// Show the workspace as soon as it is available; local home/provider lookups
+// are best-effort startup enrichment and must not keep the whole app behind
+// the splash screen.
+const bootWorkspace = loadBootWorkspace().catch((error: unknown) => {
+  console.error("MonoCode could not restore its workspace; opening a new workspace.", error);
+  return {
+    windowTransfer: null,
+    resumed: null,
+    history: [],
+    historyCwd: null,
+  };
+});
+void Promise.all([appLoaded, bootWorkspace]).then(
+  ([{ default: App }, boot]) => renderWorkspace(boot, App),
+  (error: unknown) => {
+    console.error("MonoCode could not load its workspace UI.", error);
+    const splash = document.getElementById("boot-splash");
+    if (splash) {
+      splash.replaceChildren();
+      splash.style.pointerEvents = "auto";
+      const message = document.createElement("p");
+      message.textContent = "MonoCode failed to start. Restart the app and check its logs.";
+      message.style.cssText = "max-width:32rem;padding:2rem;color:#fca5a5;font:14px/1.5 system-ui;text-align:center";
+      splash.append(message);
+    }
+  },
+);
+void Promise.all([homeDirPrimed, providerBinaryPathsPrimed]).catch(
+  (error: unknown) => {
+    console.warn("MonoCode startup enrichment failed.", error);
   },
 );

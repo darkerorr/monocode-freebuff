@@ -6,6 +6,7 @@ import {
   resolveCodexBinary,
   resolveCursorBinary,
   resolveDevinBinary,
+  resolveFreebuffBinary,
   resolveFxBinary,
   resolveGrokBinary,
   resolveHermesBinary,
@@ -58,6 +59,10 @@ const CLI: Record<HarnessId, { name: string; install?: string }> = {
     install: IS_WIN
       ? "irm https://static.devin.ai/cli/setup.ps1 | iex"
       : "curl -fsSL https://cli.devin.ai/install.sh | bash",
+  },
+  freebuff: {
+    name: "Freebuff CLI",
+    install: "npm i -g freebuff",
   },
 };
 
@@ -171,6 +176,17 @@ export function probeHarnessAvailability(
       if (id === "devin") {
         try {
           await resolveDevinBinary();
+          return [id, true] as const;
+        } catch {
+          return [id, false] as const;
+        }
+      }
+      if (id === "freebuff") {
+        // Resolution only exists in the desktop app, which is also where the
+        // private PTY this provider needs lives. A headless host cannot drive
+        // Freebuff's terminal UI.
+        try {
+          await resolveFreebuffBinary();
           return [id, true] as const;
         } catch {
           return [id, false] as const;

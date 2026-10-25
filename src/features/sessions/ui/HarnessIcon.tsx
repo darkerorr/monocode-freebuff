@@ -3,6 +3,7 @@ import claude from "../../../assets/providers/claude.svg";
 import codex from "../../../assets/providers/codex.svg";
 import cursor from "../../../assets/providers/cursor.svg";
 import devin from "../../../assets/providers/devin.svg";
+import freebuff from "../../../assets/providers/freebuff.svg";
 import fx from "../../../assets/providers/fx.svg";
 import grok from "../../../assets/providers/grok.svg";
 import hermes from "../../../assets/providers/hermes.svg";
@@ -24,6 +25,7 @@ export const HARNESS_ICONS: Record<HarnessId, string> = {
   hermes,
   antigravity,
   devin,
+  freebuff,
 };
 
 /** White marks that must follow `currentColor` so they stay visible in light mode. */
@@ -35,6 +37,7 @@ export const MONOCHROME_HARNESSES = new Set<HarnessId>([
   "fx",
   "hermes",
   "devin",
+  "freebuff",
 ]);
 
 function MonoIcon({
@@ -82,7 +85,11 @@ export function HarnessIcon({
       </MonoIcon>
     );
   }
-  if (harness === "hermes" || harness === "devin") {
+  if (
+    harness === "hermes" ||
+    harness === "devin" ||
+    harness === "freebuff"
+  ) {
     const mark = HARNESS_ICONS[harness];
     return (
       <span

@@ -562,7 +562,7 @@ fn terminate(pid: u32) {
 }
 
 #[cfg(unix)]
-fn open_pty(cols: u16, rows: u16) -> Result<(i32, i32), String> {
+pub(crate) fn open_pty(cols: u16, rows: u16) -> Result<(i32, i32), String> {
     let master = unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY) };
     if master < 0 {
         return Err(os_err("Failed to open terminal"));
@@ -626,7 +626,7 @@ fn resize_fd(fd: i32, cols: u16, rows: u16) -> Result<(), String> {
 }
 
 #[cfg(unix)]
-fn dup_fd(fd: i32) -> Result<i32, String> {
+pub(crate) fn dup_fd(fd: i32) -> Result<i32, String> {
     let next = unsafe { libc::dup(fd) };
     if next < 0 {
         return Err(os_err("Failed to duplicate terminal"));
@@ -635,14 +635,14 @@ fn dup_fd(fd: i32) -> Result<i32, String> {
 }
 
 #[cfg(unix)]
-fn dup_stdio(fd: i32) -> Result<std::process::Stdio, String> {
+pub(crate) fn dup_stdio(fd: i32) -> Result<std::process::Stdio, String> {
     use std::os::unix::io::FromRawFd;
     let next = dup_fd(fd)?;
     Ok(unsafe { std::process::Stdio::from_raw_fd(next) })
 }
 
 #[cfg(unix)]
-fn set_cloexec(fd: i32) {
+pub(crate) fn set_cloexec(fd: i32) {
     unsafe {
         let flags = libc::fcntl(fd, libc::F_GETFD);
         if flags >= 0 {
@@ -652,7 +652,7 @@ fn set_cloexec(fd: i32) {
 }
 
 #[cfg(unix)]
-fn close_fd(fd: i32) {
+pub(crate) fn close_fd(fd: i32) {
     if fd >= 0 {
         unsafe {
             libc::close(fd);

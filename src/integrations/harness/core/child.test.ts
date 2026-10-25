@@ -100,6 +100,10 @@ describe("child bridge", () => {
       .mockRejectedValueOnce(new Error("listen failed"))
       .mockReturnValueOnce(late.promise)
       .mockResolvedValueOnce(vi.fn())
+      .mockResolvedValueOnce(vi.fn())
+      .mockResolvedValueOnce(vi.fn())
+      .mockResolvedValueOnce(vi.fn())
+      .mockResolvedValueOnce(vi.fn())
       .mockResolvedValueOnce(vi.fn());
     const child = await loadChild();
     const releaseApp = child.startHarnessBridge();
@@ -116,6 +120,39 @@ describe("child bridge", () => {
     releaseProbe();
     releaseApp();
     await vi.runAllTimersAsync();
+  });
+
+  it("replays and broadcasts Freebuff PTY events under the exact session id", async () => {
+    installResolvedListeners();
+    const child = await loadChild();
+    const release = await child.acquireHarnessBridge();
+    const emit = (name: string, payload: unknown) =>
+      mocks.handlers.get(name)?.({ payload: payload as never });
+    const sessionId = "monocode-freebuff-session-7";
+    const events: unknown[] = [];
+    const unsubscribe = child.subscribeFreebuffPty((event) =>
+      events.push(event),
+    );
+
+    emit("harness-freebuff-pty", {
+      sessionId,
+      data: "Enter a coding task or / for commands\\r\\n",
+    });
+    expect(events).toEqual([
+      {
+        kind: "data",
+        sessionId,
+        data: "Enter a coding task or / for commands\\r\\n",
+      },
+    ]);
+
+    const replayed: string[] = [];
+    child.subscribeFreebuffPty((event) => {
+      if (event.kind === "data") replayed.push(event.data);
+    });
+    expect(replayed.join("")).toContain("Enter a coding task");
+    unsubscribe();
+    release();
   });
 
   it("reconciles an exit that arrives before spawn returns its pid", async () => {

@@ -112,6 +112,10 @@ export class HostChildBackend implements ChildBackend {
   }
 
   async resolve(provider: RemoteProvider): Promise<string> {
+    if (provider === "freebuff")
+      throw new Error(
+        "Freebuff is only available in the MonoCode desktop app: its terminal UI needs the desktop PTY",
+      );
     if (this.binaries[provider]) return this.binaries[provider]!;
     return resolveProvider(provider);
   }

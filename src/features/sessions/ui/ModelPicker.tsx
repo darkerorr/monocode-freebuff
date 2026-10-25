@@ -5,10 +5,12 @@ import {
   Gauge,
   Search,
   Star,
+  RotateCcw,
   Zap,
 } from "../../../shared/ui/icons";
 import {
   Fragment,
+  useCallback,
   useEffect,
   useId,
   useMemo,
@@ -44,6 +46,17 @@ import {
   getHarnessAvailabilitySnapshot,
 } from "../../../integrations/harness/core/availability";
 import { useModelSource, type ModelSource } from "./modelSource";
+import {
+  getFreebuffAccountSnapshot,
+  subscribeFreebuffAccount,
+  type FreebuffAccountSnapshot,
+} from "../../providers/model/freebuffAccount";
+import { FREEBUFF_SESSION_MODEL } from "../model/models";
+import {
+  getActiveFreebuffSessionId,
+  listFreebuffModels,
+  selectFreebuffModel,
+} from "../../../integrations/harness/providers/freebuff/freebuff";
 import { HARNESSES, HARNESS_TITLE, type HarnessId } from "../model/session";
 import { useLockOverscroll } from "../../../shared/hooks/useLockOverscroll";
 import { LAYER } from "../../../shared/lib/layers";
@@ -59,6 +72,8 @@ type Props = {
   values: Record<string, string>;
   /** Project whose disabled providers are hidden from the picker. */
   project?: string;
+  /** Running session whose Freebuff PTY controls the interactive model list. */
+  sessionId?: string;
   /** Hide option rows from the menu when they render as pills beside the picker. */
   hideSettings?: boolean;
   /** Limit provider tabs for surfaces that only support one harness. */
@@ -261,7 +276,9 @@ function groupsByProvider(tab: ModelPickerTab, models: AgentModel[]): boolean {
 
 /** Use the upstream provider when present, otherwise the model's harness. */
 function modelProvider(item: AgentModel): { id: string; name: string } {
-  return item.provider ?? { id: item.harness, name: HARNESS_TITLE[item.harness] };
+  return (
+    item.provider ?? { id: item.harness, name: HARNESS_TITLE[item.harness] }
+  );
 }
 
 /**
@@ -307,8 +324,231 @@ function modelGroups(tab: ModelPickerTab, models: AgentModel[]): ModelGroup[] {
   return [...groups.values()];
 }
 
+/** The Freebuff model is selected inside its terminal, not by MonoCode. */
+function useFreebuffAccount(): FreebuffAccountSnapshot {
+  return useSyncExternalStore(
+    subscribeFreebuffAccount,
+    getFreebuffAccountSnapshot,
+    getFreebuffAccountSnapshot,
+  );
+}
+
+function FreebuffSessionContent({
+  currentId,
+  preferredSessionId,
+  available,
+  onPick,
+}: {
+  currentId: string;
+  preferredSessionId?: string;
+  available: boolean;
+  onPick: (model: AgentModel) => void;
+}) {
+  const account = useFreebuffAccount();
+  const [changingModel, setChangingModel] = useState(false);
+  const [modelError, setModelError] = useState<string | null>(null);
+  const [modelListError, setModelListError] = useState<string | null>(null);
+  const [loadingModels, setLoadingModels] = useState(false);
+  const [controlSessionId, setControlSessionId] = useState<string | null>(null);
+  const [models, setModels] = useState<FreebuffAccountSnapshot["models"]["value"]>(null);
+
+  const refreshModels = useCallback(() => {
+    const targetSessionId = getActiveFreebuffSessionId(preferredSessionId);
+    setModelError(null);
+    setModelListError(null);
+    setModels(null);
+    if (!targetSessionId) {
+      setControlSessionId(null);
+      setModelListError("No active Freebuff session. Start one in MonoCode to read its /model choices.");
+      return;
+    }
+    setControlSessionId(targetSessionId);
+    setLoadingModels(true);
+    void listFreebuffModels(targetSessionId)
+      .then((nextModels) => setModels(nextModels))
+      .catch((error: unknown) => {
+        setModelListError(error instanceof Error ? error.message : String(error));
+      })
+      .finally(() => setLoadingModels(false));
+  }, [preferredSessionId]);
+
+  useEffect(() => {
+    refreshModels();
+  }, [refreshModels]);
+
+  return (
+    <div className="p-2">
+      <FreebuffModelDisplay account={account} />
+      <div className="mt-2 flex items-center justify-between gap-2">
+        <p className="text-[11px] leading-relaxed text-content/45">
+          Models are read live from Freebuff&apos;s own <code>/model</code> picker.
+        </p>        <button
+          type="button"
+          aria-label="Refresh Freebuff models"
+          title="Refresh Freebuff models"
+          disabled={!available || loadingModels || changingModel}
+          onMouseDown={(event) => event.preventDefault()}
+
+
+          onClick={refreshModels}
+          className="grid size-7 shrink-0 place-items-center rounded-md text-content/45 hover:bg-content/5 disabled:opacity-40"
+        >
+          <RotateCcw
+            className={`size-3.5 ${loadingModels ? "animate-spin" : ""}`}
+          />
+        </button>
+      </div>
+      {loadingModels ? (
+        <p role="status" className="mt-1 text-[11px] text-content/50">
+          Reading models from the active Freebuff terminal…
+        </p>
+      ) : null}
+      {models?.length ? (
+        <div className="mt-2 flex flex-wrap gap-1.5" aria-label="Available Freebuff models">
+          {models.map((item) => (
+            <button
+              key={item.name}
+              type="button"
+              disabled={!available || !controlSessionId || changingModel || loadingModels}
+              aria-pressed={item.selected}
+              onMouseDown={(event) => event.preventDefault()}
+              onClick={() => {
+                setChangingModel(true);
+                setModelError(null);
+                if (!controlSessionId) {
+                  setModelError("No active Freebuff session is available to apply this model.");
+                  return;
+                }
+                void selectFreebuffModel(controlSessionId, item.name)
+                  .then(() => {
+                    setModels((current) => current?.map((choice) => ({
+                      ...choice,
+                      selected: choice.name === item.name,
+                    })) ?? null);
+                    if (currentId !== FREEBUFF_SESSION_MODEL.id) {
+                      onPick(FREEBUFF_SESSION_MODEL);
+                    }
+                  })
+                  .catch((error: unknown) => {
+                    setModelError(error instanceof Error ? error.message : String(error));
+                  })
+                  .finally(() => setChangingModel(false));
+              }}
+              className="rounded-md border border-content/10 px-2 py-1 text-[11px] text-content/70 hover:bg-content/5 disabled:opacity-40"
+              title={item.descriptors.join(" · ") || undefined}
+            >
+              {item.name}{item.effort ? ` · ${item.effort}` : ""}{item.selected ? " (current)" : ""}
+            </button>
+          ))}
+        </div>
+      ) : !loadingModels && !modelListError ? (
+        <p className="mt-1 text-[11px] text-content/45">
+          No model choices have been read from an active Freebuff terminal yet.
+        </p>
+      ) : null}
+      {modelListError ? (
+        <p role="alert" className="mt-1 text-[11px] text-red-400">
+          {modelListError}
+        </p>
+      ) : null}
+      {changingModel ? (
+        <p role="status" className="mt-1 text-[11px] text-content/50">
+          Waiting for Freebuff to confirm the model change…
+        </p>
+      ) : null}
+      {modelError ? (
+        <p role="alert" className="mt-1 text-[11px] text-red-400">
+          {modelError}
+        </p>
+      ) : null}
+      {account.context.value ||
+      account.dailyHours.value ||
+      account.sessionLeftMinutes.value != null ? (
+        <div className="mt-2 space-y-1 border-t border-stroke pt-2 text-[11px] text-content/55">
+          {account.context.value ? (
+            <div>
+              Context used: {account.context.value.label} (
+              {account.context.value.percent}%) · max capacity not reported
+            </div>
+          ) : null}
+          {account.dailyHours.value ? (
+            <div>
+              Balance: {account.dailyHours.value.remaining} /{" "}
+              {account.dailyHours.value.limit} hours remaining
+            </div>
+          ) : null}
+          {account.sessionLeftMinutes.value != null ? (
+            <div>Session time: {account.sessionLeftMinutes.value} min left</div>
+          ) : null}
+        </div>
+      ) : null}
+      {currentId !== FREEBUFF_SESSION_MODEL.id ? (
+        <button
+          type="button"
+          disabled={!available}
+          title={!available ? harnessUnavailableHint("freebuff") : undefined}
+          onMouseDown={(event) => event.preventDefault()}
+          onClick={() => onPick(FREEBUFF_SESSION_MODEL)}
+          className="mt-2 flex h-8 w-full items-center justify-between rounded-lg px-2 text-left text-[12px] text-content/75 hover:bg-content/5 disabled:cursor-not-allowed disabled:opacity-40"
+        >
+          Use Freebuff for this session
+          <Check className="size-3.5" strokeWidth={2} />
+        </button>
+      ) : null}
+    </div>
+  );
+}
+
+/** Freebuff's model selector belongs to the CLI, not MonoCode's catalog. */
+function FreebuffModelDisplay({
+  labelClassName = "",
+  account,
+}: {
+  labelClassName?: string;
+  account: FreebuffAccountSnapshot;
+}) {
+  const model = account.model.value;
+
+  return (
+    <span
+      className={`flex min-w-0 shrink-0 items-center gap-1.5 text-content/75 ${labelClassName}`}
+      title="Model reported by the active Freebuff terminal."
+      aria-live="polite"
+      aria-label={
+        model
+          ? `Freebuff model: ${model.name}`
+          : "Freebuff model not yet reported"
+      }
+    >
+      <HarnessIcon harness="freebuff" className="size-3.5 shrink-0" />
+      <span className="min-w-0 truncate">
+        {model?.name ?? FREEBUFF_SESSION_MODEL.name}
+      </span>
+      {model?.effort ? (
+        <span className="shrink-0 text-content/50">{model.effort}</span>
+      ) : null}
+    </span>
+  );
+}
+
+type CatalogProps = Props & { freebuffAccount?: FreebuffAccountSnapshot };
+
+/** Preserve the regular chooser for Freebuff sessions while observing its CLI-owned model. */
+export function ModelPicker(props: Props) {
+  return props.harness === "freebuff" ? (
+    <FreebuffAwareModelPicker {...props} />
+  ) : (
+    <CatalogModelPicker {...props} />
+  );
+}
+
+function FreebuffAwareModelPicker(props: Props) {
+  const account = useFreebuffAccount();
+  return <CatalogModelPicker {...props} freebuffAccount={account} />;
+}
+
 /** Model selection and settings control shared by the composer and session toolbar. */
-export function ModelPicker({
+function CatalogModelPicker({
   harness,
   model,
   values,
@@ -323,7 +563,9 @@ export function ModelPicker({
   onChange,
   onSettingsChange,
   onClose,
-}: Props) {
+  freebuffAccount,
+  sessionId,
+}: CatalogProps) {
   const source = useModelSource();
   const catalogVersion = useSyncExternalStore(
     subscribeModels,
@@ -368,14 +610,24 @@ export function ModelPicker({
   openRef.current = open;
   recentOpenRef.current = recentMenu != null;
 
-  const current = source.resolve(harness, model);
+  const resolvedCurrent = source.resolve(harness, model);
+  const freebuffActiveModel = freebuffAccount?.model.value ?? null;
+  const current =
+    harness === "freebuff"
+      ? {
+          ...FREEBUFF_SESSION_MODEL,
+          name: freebuffActiveModel?.name ?? FREEBUFF_SESSION_MODEL.name,
+        }
+      : resolvedCurrent;
   currentRef.current = current;
   const settings = useMemo(() => {
     void catalogVersion;
     // In beside-picker mode every option row renders as a toolbar pill, so the
-    // menu lists models only.
-    return hideSettings ? [] : pickerSettings(current);
-  }, [catalogVersion, current, hideSettings]);
+    // menu lists models only. Freebuff settings stay in its own terminal.
+    return hideSettings || harness === "freebuff"
+      ? []
+      : pickerSettings(current);
+  }, [catalogVersion, current, harness, hideSettings]);
   const entries = useMemo<MenuEntry[]>(
     () => [
       ...settings.map((setting) => ({
@@ -387,21 +639,24 @@ export function ModelPicker({
     [settings],
   );
 
-  const triggerEffortSetting = hideSettings
-    ? undefined
-    : effortSetting(current);
+  const triggerEffortSetting =
+    hideSettings || harness === "freebuff" ? undefined : effortSetting(current);
   const triggerEffortLabel = triggerEffortSetting
     ? settingValueLabel(triggerEffortSetting, values)
     : undefined;
   const triggerModelName =
-    current.harness === "claude"
-      ? current.name.replace(/^Claude /, "")
-      : current.name;
+    harness === "freebuff"
+      ? (freebuffActiveModel?.name ?? current.name)
+      : current.harness === "claude"
+        ? current.name.replace(/^Claude /, "")
+        : current.name;
   const triggerTitle = [
     HARNESS_TITLE[current.harness],
     current.provider?.name,
-    current.name,
-    triggerEffortLabel,
+    harness === "freebuff"
+      ? (freebuffActiveModel?.name ?? current.name)
+      : current.name,
+    harness === "freebuff" ? freebuffActiveModel?.effort : triggerEffortLabel,
   ]
     .filter(Boolean)
     .join(" · ");
@@ -750,7 +1005,9 @@ export function ModelPicker({
         }
         aria-keyshortcuts={`${MOD}.`}
         aria-expanded={open || recentMenu != null}
-        aria-haspopup={hideSettings ? "dialog" : "menu"}
+        aria-haspopup={
+          hideSettings || harness === "freebuff" ? "dialog" : "menu"
+        }
         onMouseDown={(event) => event.preventDefault()}
         onContextMenu={(event) => {
           event.preventDefault();
@@ -779,13 +1036,20 @@ export function ModelPicker({
         <span
           className={`whitespace-nowrap ${variant === "pill" ? "text-[11px]" : ""} ${labelClassName}`}
         >
-          {triggerLabel ?? triggerModelName}
+          {harness === "freebuff"
+            ? triggerModelName
+            : (triggerLabel ?? triggerModelName)}
         </span>
-        {!triggerLabel && triggerEffortLabel ? (
+        {!triggerLabel &&
+        (harness === "freebuff"
+          ? freebuffActiveModel?.effort
+          : triggerEffortLabel) ? (
           <span
             className={`shrink-0 text-content/50 ${variant === "pill" ? "text-[11px]" : ""} ${labelClassName}`}
           >
-            {triggerEffortLabel}
+            {harness === "freebuff"
+              ? freebuffActiveModel?.effort
+              : triggerEffortLabel}
           </span>
         ) : null}
         {variant === "text" ? null : (
@@ -796,9 +1060,10 @@ export function ModelPicker({
         )}
       </button>
 
-      {open && hideSettings ? (
+      {open && (hideSettings || harness === "freebuff") ? (
         <ModelFlyout
           anchor={button}
+          preferredFreebuffSessionId={sessionId}
           side={side}
           autoFocusSearch
           onDismiss={(reason) => dismiss(reason === "escape")}
@@ -818,7 +1083,7 @@ export function ModelPicker({
         />
       ) : null}
 
-      {open && !hideSettings ? (
+      {open && !hideSettings && harness !== "freebuff" ? (
         <>
           <Popover
             anchor={button}
@@ -997,6 +1262,7 @@ export function ModelPicker({
           {showSubmenu && submenu.kind === "models" ? (
             <ModelFlyout
               anchor={activeRow}
+              preferredFreebuffSessionId={sessionId}
               autoFocusSearch
               harnesses={pickerHarnesses}
               tab={visibleTab}
@@ -1471,6 +1737,7 @@ function SelectPill({
 
 function ModelFlyout({
   anchor,
+  preferredFreebuffSessionId,
   side = "right",
   autoFocusSearch = false,
   onDismiss,
@@ -1489,6 +1756,7 @@ function ModelFlyout({
   onToggleFavorite,
 }: {
   anchor: HTMLButtonElement | { current: HTMLButtonElement | null };
+  preferredFreebuffSessionId?: string;
   side?: "right" | "top" | "bottom";
   autoFocusSearch?: boolean;
   onDismiss?: (reason: "outside" | "escape") => void;
@@ -1650,7 +1918,18 @@ function ModelFlyout({
           aria-label="Models"
           className="min-h-0 flex-1 overflow-y-auto overscroll-none p-1"
         >
-          {models.length === 0 ? (
+          {tab === "freebuff" ? (
+            <FreebuffSessionContent
+              currentId={currentId}
+              preferredSessionId={preferredFreebuffSessionId}
+              available={source.available("freebuff")}
+              onPick={onPick}
+            />
+          ) : tab === "favorites" && !query.trim() && models.length === 0 ? (
+            <div className="px-2 py-3 text-[12px] text-content/50">
+              No favorite models
+            </div>
+          ) : models.length === 0 ? (
             <div className="px-2 py-3 text-[12px] text-content/50">
               {tab === "favorites" && !query.trim()
                 ? "No favorite models"

@@ -19,8 +19,21 @@ let availability: HarnessAvailability = {
   hermes: false,
   antigravity: false,
   devin: false,
+  freebuff: false,
 };
 let version = 0;
+let freebuffAvailabilityVersion = 0;
+
+/**
+ * Charm-only update for the Freebuff availability ring. Distinct from the
+ * on/off availability above so account/model reads can recompute the Freebuff
+ * row without re-probing every harness in the background.
+ */
+export function emitFreebuffAvailabilityChanged(): void {
+  freebuffAvailabilityVersion += 1;
+  for (const listener of listeners) listener();
+}
+
 let probedAt = 0;
 const listeners = new Set<() => void>();
 
@@ -42,12 +55,23 @@ export function getHarnessAvailabilitySnapshot(): number {
   return version;
 }
 
+/** Charm-only availability ring version for the Freebuff row. */
+export function getFreebuffAvailabilityVersion(): number {
+  return freebuffAvailabilityVersion;
+}
+
 export function hasProbedHarnessAvailability(): boolean {
   return probedAt > 0;
 }
 
 export function isHarnessAvailable(id: HarnessId): boolean {
   return availability[id];
+}
+
+export type HarnessAvailabilitySnapshot = HarnessAvailability;
+
+export function getHarnessAvailabilityMap(): HarnessAvailability {
+  return availability;
 }
 
 export function setHarnessAvailability(next: HarnessAvailability): void {

@@ -81,6 +81,10 @@ const resolveBinary: Record<RemoteProvider, () => Promise<{ path: string }>> = {
   hermes: () => resolveHermesBinary(),
   antigravity: () => resolveAntigravityBinary(),
   devin: () => resolveDevinBinary(),
+  // Never advertised by the headless host; see HostChildBackend.resolve.
+  freebuff: async () => {
+    throw new Error("Freebuff requires the MonoCode desktop app");
+  },
 };
 // A 1 MiB text file can expand to 6 MiB when JSON escapes control characters.
 // Existing files.write sends both the original and replacement contents.
@@ -97,6 +101,7 @@ const discoverModels: Record<RemoteProvider, (cwd: string) => Promise<AgentModel
   hermes: discoverHermesModels,
   antigravity: discoverAntigravityModels,
   devin: discoverDevinModels,
+  freebuff: async () => [],
 };
 
 async function body(

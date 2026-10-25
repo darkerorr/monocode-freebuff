@@ -148,6 +148,21 @@ export const hostProviders: Record<RemoteProvider, HostProvider> = {
     approve: antigravity.respondAntigravityApproval,
     answer: unsupportedQuestion,
   },
+  freebuff: {
+    // Freebuff is a terminal UI with no ACP or headless mode. Driving it needs
+    // a private PTY, which only the desktop app owns; the headless host never
+    // advertises this provider (see HostChildBackend.resolve).
+    send: async () => {
+      throw new Error(
+        "Freebuff is only available in the MonoCode desktop app",
+      );
+    },
+    cancel: async () => undefined,
+    stop: async () => undefined,
+    bind: () => undefined,
+    approve: () => undefined,
+    answer: () => undefined,
+  },
   devin: {
     send: devin.sendDevinTurn,
     compact: devin.compactDevinContext,

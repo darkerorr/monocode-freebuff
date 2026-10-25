@@ -108,6 +108,36 @@ type SseEndPayload = { sessionId: string; error?: string | null };
 
 type LineHandler = (line: string) => void;
 type ExitHandler = (code: number | null) => void;
+
+/** Freebuff's terminal UI is driven through a private PTY, not line JSON. */
+export type FreebuffPtyData = { sessionId: string; data: string };
+export type FreebuffPtyExit = {
+  sessionId: string;
+  code: number | null;
+  pid?: number;
+};
+
+export type FreebuffPtyEvent =
+  | { kind: "data"; sessionId: string; data: string }
+  | { kind: "exit"; sessionId: string; code: number | null };
+
+export type FreebuffPtySubscriber = (event: FreebuffPtyEvent) => void;
+
+const freebuffPtySubscribers = new Set<FreebuffPtySubscriber>();
+const freebuffPtyReplay = new Map<string, string>();
+const MAX_FREEBUFF_REPLAY_CHARS = 64_000;
+
+/** Subscribe to active Freebuff PTYs and replay their bounded current screen. */
+export function subscribeFreebuffPty(
+  subscriber: FreebuffPtySubscriber,
+): () => void {
+  freebuffPtySubscribers.add(subscriber);
+  for (const [sessionId, data] of freebuffPtyReplay) {
+    subscriber({ kind: "data", sessionId, data });
+  }
+  return () => freebuffPtySubscribers.delete(subscriber);
+}
+
 type SseHandler = (data: string) => void;
 type SseEndHandler = (error?: string) => void;
 
@@ -118,6 +148,10 @@ const stderrHandlers = new Map<string, LineHandler>();
 const sseHandlers = new Map<string, SseHandler>();
 const sseEndHandlers = new Map<string, SseEndHandler>();
 const sseBuffer = new Map<string, string[]>();
+const freebuffPtyHandlers = new Map<string, (data: string) => void>();
+const freebuffPtyExitHandlers = new Map<string, ExitHandler>();
+const freebuffPtyBuffer = new Map<string, string[]>();
+const freebuffPendingExit = new Map<string, number | null>();
 // Output is broadcast to every window. Only ids this window spawned or opened
 // may buffer while unwatched; anything else would be held until the bridge
 // is torn down, since nothing here ever watches or unwatches it.
@@ -233,6 +267,40 @@ function ensureBridge() {
         sseEndHandlers.get(sessionId)?.(error ?? undefined);
       }),
     ),
+    register(
+      listen<FreebuffPtyData>("harness-freebuff-pty", (event) => {
+        const { sessionId, data } = event.payload;
+        if (ownedChildren.has(sessionId) || freebuffPtySubscribers.size > 0) {
+          const replay = `${freebuffPtyReplay.get(sessionId) ?? ""}${data}`;
+          freebuffPtyReplay.set(
+            sessionId,
+            replay.slice(-MAX_FREEBUFF_REPLAY_CHARS),
+          );
+        }
+        for (const subscriber of freebuffPtySubscribers) {
+          subscriber({ kind: "data", sessionId, data });
+        }
+        const handler = freebuffPtyHandlers.get(sessionId);
+        if (handler) handler(data);
+        else if (ownedChildren.has(sessionId)) {
+          pushBounded(freebuffPtyBuffer, sessionId, data);
+        }
+      }),
+    ),
+    register(
+      listen<FreebuffPtyExit>("harness-freebuff-exit", (event) => {
+        const { sessionId, code } = event.payload;
+        freebuffPtyReplay.delete(sessionId);
+        for (const subscriber of freebuffPtySubscribers) {
+          subscriber({ kind: "exit", sessionId, code });
+        }
+        const handler = freebuffPtyExitHandlers.get(sessionId);
+        if (handler) handler(code);
+        else if (ownedChildren.has(sessionId)) {
+          freebuffPendingExit.set(sessionId, code);
+        }
+      }),
+    ),
   ]).catch((error: unknown) => {
     failed = true;
     installed.splice(0).forEach((unlisten) => unlisten());
@@ -257,6 +325,11 @@ function teardownBridge() {
   sseHandlers.clear();
   sseEndHandlers.clear();
   sseBuffer.clear();
+  freebuffPtyHandlers.clear();
+  freebuffPtyExitHandlers.clear();
+  freebuffPtyBuffer.clear();
+  freebuffPendingExit.clear();
+  freebuffPtyReplay.clear();
   ownedChildren.clear();
   ownedSse.clear();
   livePid.clear();
@@ -345,6 +418,34 @@ export function unwatchSse(sessionId: string) {
   sseEndHandlers.delete(sessionId);
   sseBuffer.delete(sessionId);
   ownedSse.delete(sessionId);
+}
+
+/**
+ * Watch one Freebuff PTY. Output produced between spawn and this call is
+ * replayed, so a TUI that greets the user immediately is not missed.
+ */
+export function watchFreebuffPty(
+  sessionId: string,
+  onData: (data: string) => void,
+  onExit: ExitHandler,
+): void {
+  const buffered = freebuffPtyBuffer.get(sessionId);
+  freebuffPtyBuffer.delete(sessionId);
+  freebuffPtyHandlers.set(sessionId, onData);
+  freebuffPtyExitHandlers.set(sessionId, onExit);
+  if (buffered) buffered.forEach(onData);
+  const exit = freebuffPendingExit.get(sessionId);
+  if (exit !== undefined) {
+    freebuffPendingExit.delete(sessionId);
+    onExit(exit);
+  }
+}
+
+export function unwatchFreebuffPty(sessionId: string): void {
+  freebuffPtyHandlers.delete(sessionId);
+  freebuffPtyExitHandlers.delete(sessionId);
+  freebuffPtyBuffer.delete(sessionId);
+  freebuffPendingExit.delete(sessionId);
 }
 
 export async function spawnChild(
@@ -439,6 +540,7 @@ async function resolveHarnessBinary(
     hermes: "harness_resolve_hermes",
     antigravity: "harness_resolve_antigravity",
     devin: "harness_resolve_devin",
+    freebuff: "harness_resolve_freebuff",
   };
   return invoke(command[provider]);
 }
@@ -501,6 +603,163 @@ export function resolveDevinBinary(
   binaryPath?: string | null,
 ): Promise<{ path: string }> {
   return resolveHarnessBinary("devin", binaryPath);
+}
+
+export function resolveFreebuffBinary(
+  binaryPath?: string | null,
+): Promise<{ path: string }> {
+  return resolveHarnessBinary("freebuff", binaryPath);
+}
+
+/** The subset of Freebuff's persisted transcript MonoCode consumes. */
+export type FreebuffChatBlock = {
+  type: string;
+  textType?: string;
+  content?: string;
+  toolCallId?: string;
+  toolName?: string;
+  input?: unknown;
+  output?: string;
+};
+
+export type FreebuffChatMessage = {
+  id: string;
+  variant: "user" | "ai";
+  content: string;
+  isComplete?: boolean;
+  completionTime?: string;
+  blocks: FreebuffChatBlock[];
+};
+
+export type FreebuffChatSnapshot = {
+  messages: FreebuffChatMessage[];
+  size: number;
+  mtimeMs: number;
+};
+
+/**
+ * Reserve the conversation folder Freebuff resumes. Its chats are keyed by an
+ * id, so creating the empty transcript first makes MonoCode's session and
+ * Freebuff's chat the same object instead of "whichever folder is newest".
+ */
+export function prepareFreebuffChat(
+  cwd: string,
+  chatId: string,
+): Promise<{ path: string; created: boolean }> {
+  return invoke("harness_freebuff_prepare_chat", { cwd, chatId });
+}
+
+export function readFreebuffChat(
+  cwd: string,
+  chatId: string,
+): Promise<FreebuffChatSnapshot> {
+  return invoke("harness_freebuff_read_chat", { cwd, chatId });
+}
+
+export function spawnFreebuffPty(input: {
+  sessionId: string;
+  command: string;
+  cwd: string;
+  chatId: string;
+  binaryPath?: string | null;
+}): Promise<number> {
+  ownedChildren.add(input.sessionId);
+  freebuffPendingExit.delete(input.sessionId);
+  freebuffPtyReplay.delete(input.sessionId);
+  return invoke<number>("harness_freebuff_pty_spawn", input);
+}
+
+export function writeFreebuffPty(
+  sessionId: string,
+  data: string,
+): Promise<void> {
+  return invoke("harness_freebuff_pty_write", { sessionId, data });
+}
+
+export function killFreebuffPty(sessionId: string): Promise<void> {
+  freebuffPtyReplay.delete(sessionId);
+  return invoke("harness_freebuff_pty_kill", { sessionId });
+}
+
+/** Apply a model change through Freebuff's interactive /model picker. */
+export type FreebuffModelChoice = {
+  name: string;
+  effort: string | null;
+  descriptors: string[];
+  selected: boolean;
+};
+
+export type FreebuffPtyModelControlRequest =
+  | {
+      sessionId: string;
+      action: "list";
+      resolve: (models: FreebuffModelChoice[]) => void;
+      reject: (error: Error) => void;
+    }
+  | {
+      sessionId: string;
+      action: "select";
+      data: string;
+      resolve: () => void;
+      reject: (error: Error) => void;
+    };
+
+const freebuffPtyModelControlSubscribers = new Set<
+  (request: FreebuffPtyModelControlRequest) => boolean
+>();
+
+export function subscribeFreebuffPtyWrites(
+  subscriber: (request: FreebuffPtyModelControlRequest) => boolean,
+): () => void {
+  freebuffPtyModelControlSubscribers.add(subscriber);
+  return () => freebuffPtyModelControlSubscribers.delete(subscriber);
+}
+
+function dispatchFreebuffModelControl(
+  request: FreebuffPtyModelControlRequest,
+  unavailableMessage: string,
+): void {
+  if (freebuffPtyModelControlSubscribers.size === 0) {
+    request.reject(new Error("Freebuff model control is not available."));
+    return;
+  }
+  let accepted = false;
+  for (const subscriber of freebuffPtyModelControlSubscribers) {
+    try {
+      accepted = subscriber(request) || accepted;
+    } catch (error) {
+      request.reject(error instanceof Error ? error : new Error(String(error)));
+    }
+  }
+  if (!accepted) request.reject(new Error(unavailableMessage));
+}
+
+export function requestFreebuffModelChange(
+  sessionId: string,
+  modelName: string,
+): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    dispatchFreebuffModelControl(
+      { sessionId, action: "select", data: modelName, resolve, reject },
+      "No active Freebuff PTY accepted the model change.",
+    );
+  });
+}
+
+export function requestFreebuffModelChoices(
+  sessionId: string,
+): Promise<FreebuffModelChoice[]> {
+  return new Promise<FreebuffModelChoice[]>((resolve, reject) => {
+    dispatchFreebuffModelControl(
+      { sessionId, action: "list", resolve, reject },
+      "No active Freebuff PTY accepted the model-list request.",
+    );
+  });
+}
+
+export function killAllFreebuffPtys(): Promise<void> {
+  freebuffPtyReplay.clear();
+  return invoke("harness_freebuff_pty_kill_all");
 }
 
 export function resolveAntigravityBinary(

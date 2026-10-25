@@ -6,6 +6,7 @@ import {
   defaultModelId,
   defaultSessionChoice,
   encodeModelLaunchId,
+  FREEBUFF_SESSION_MODEL,
   firstEnabledHarness,
   hasLiveCatalog,
   isPickerProviderVisible,
@@ -404,6 +405,14 @@ describe("live catalog overlays", () => {
       harness: "codex",
       name: "Codex",
     });
+  });
+
+  it("resolves Freebuff to its stable session identity without inventing a catalog model", () => {
+    expect(resolveModel("freebuff")).toEqual(FREEBUFF_SESSION_MODEL);
+    expect(resolveModel("freebuff", "not-a-freebuff-model")).toEqual(
+      FREEBUFF_SESSION_MODEL,
+    );
+    expect(newSession("freebuff", "/repo").model).toBe("freebuff:session");
   });
 
   it("is empty until a CLI catalog replaces the fallback list", () => {

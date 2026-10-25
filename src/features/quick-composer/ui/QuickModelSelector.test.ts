@@ -4,11 +4,76 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { QuickModelSelector } from "./QuickModelSelector";
 import {
+  FREEBUFF_SESSION_MODEL,
   resetHarnessModelOverlays,
   setHarnessModels,
   saveLastModelSettings,
   type AgentModel,
 } from "../../sessions/model/models";
+
+const freebuffControl = vi.hoisted(() => {
+  const listFreebuffModels = vi.fn(async () => [
+    { name: "GPT-6.1 Sol", effort: "high", descriptors: [], selected: true },
+    { name: "MiMo v2.6 Flash Slow", effort: null, descriptors: [], selected: false },
+  ]);
+  const selectFreebuffModel = vi.fn(async () => undefined);
+  return {
+    listFreebuffModels,
+    selectFreebuffModel,
+    getActiveFreebuffSessionId: vi.fn(() => "freebuff-running-session"),
+  };
+});
+
+vi.mock("../../../integrations/harness/providers/freebuff/freebuff", () => freebuffControl);
+
+const freebuffStore = vi.hoisted(() => {
+  const unavailable = {
+    state: "unknown",
+    value: null,
+    reason: null,
+    source: "Freebuff terminal",
+    checkedAt: null,
+  };
+  const listeners = new Set<() => void>();
+  let snapshot = {
+    model: unavailable,
+    models: unavailable,
+    context: unavailable,
+    contextCapacity: unavailable,
+    dailyHours: unavailable,
+    sessionLeftMinutes: unavailable,
+  };
+  return {
+    getSnapshot: () => snapshot,
+    subscribe: (listener: () => void) => {
+      listeners.add(listener);
+      return () => listeners.delete(listener);
+    },
+    setModel: (value: { name: string; effort: string } | null) => {
+      snapshot = {
+        ...snapshot,
+        model: {
+          ...unavailable,
+          value,
+          state: value ? "available" : "unknown",
+        },
+      };
+      for (const listener of listeners) listener();
+    },
+    setModels: (value: Array<{ name: string; effort: string | null; descriptors: string[]; selected: boolean }> | null) => {
+      snapshot = {
+        ...snapshot,
+        models: { ...unavailable, value, state: value ? "available" : "unavailable" },
+      };
+      for (const listener of listeners) listener();
+    },
+  };
+});
+
+vi.mock("../../providers/model/freebuffAccount", () => ({
+  getFreebuffAccountSnapshot: freebuffStore.getSnapshot,
+  subscribeFreebuffAccount: freebuffStore.subscribe,
+}));
 
 vi.mock("@tauri-apps/api/event", () => ({
   emit: vi.fn().mockResolvedValue(undefined),
@@ -58,6 +123,9 @@ beforeEach(() => {
   resetHarnessModelOverlays();
   setHarnessModels("claude", [claude]);
   setHarnessModels("grok", [grok]);
+  freebuffStore.setModel(null);
+  freebuffControl.listFreebuffModels.mockClear();
+  freebuffControl.selectFreebuffModel.mockClear();
   container = document.createElement("div");
   document.body.append(container);
   root = createRoot(container);
@@ -66,7 +134,7 @@ beforeEach(() => {
       createElement(QuickModelSelector, {
         model: claude,
         values: { effort: "low" },
-        availableHarnesses: ["claude", "grok"],
+        availableHarnesses: ["claude", "grok", "freebuff"],
         onChange,
         onSettingsChange,
         onClose,
@@ -85,7 +153,7 @@ afterEach(() => {
 
 it("browses one provider at a time and selects a model without closing settings", () => {
   const tabs = container.querySelectorAll('[role="tab"]');
-  expect(tabs).toHaveLength(3); // Favorites and the two available providers.
+  expect(tabs).toHaveLength(4); // Favorites and the three available providers.
   expect(container.querySelector('[role="listbox"]')?.textContent).toContain(
     "Test Claude",
   );
@@ -107,6 +175,67 @@ it("browses one provider at a time and selects a model without closing settings"
   );
   expect(onChange).toHaveBeenCalledWith(grok);
   expect(onClose).not.toHaveBeenCalled();
+});
+
+it("loads real Freebuff choices from the PTY and selects them without leaving the composer", async () => {
+  act(() => freebuffStore.setModel({ name: "GPT-6.1 Sol", effort: "high" }));
+  act(() =>
+    root.render(
+      createElement(QuickModelSelector, {
+        model: claude,
+        values: {},
+        availableHarnesses: ["claude", "grok", "freebuff"],
+        onChange,
+        onSettingsChange,
+        onClose,
+      }),
+    ),
+  );
+
+  await act(async () => {
+    container
+      .querySelector<HTMLButtonElement>('[role="tab"][aria-label="Freebuff"]')!
+      .click();
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+  const list = container.querySelector('[role="listbox"]')!;
+  expect(freebuffControl.listFreebuffModels).toHaveBeenCalledWith("freebuff-running-session");
+  expect(list.textContent).toContain("GPT-6.1 Sol");
+  expect(list.textContent).toContain("high");
+  expect(list.textContent).not.toContain("No matching models");
+  expect(list.textContent).toContain("MiMo v2.6 Flash Slow");
+
+  await act(async () => {
+    [...list.querySelectorAll<HTMLButtonElement>("button")]
+      .find((button) => button.textContent?.includes("MiMo v2.6 Flash Slow"))!
+      .click();
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+  expect(freebuffControl.selectFreebuffModel).toHaveBeenCalledWith(
+    "freebuff-running-session",
+    "MiMo v2.6 Flash Slow",
+  );
+  expect(onChange).toHaveBeenCalledWith(FREEBUFF_SESSION_MODEL);
+});
+
+it("shows a clear no-session error instead of claiming the model list was loaded", async () => {
+  freebuffControl.getActiveFreebuffSessionId.mockReturnValue(null);
+  await act(async () => {
+    root.render(createElement(QuickModelSelector, {
+      model: claude,
+      values: {},
+      availableHarnesses: ["claude", "grok", "freebuff"],
+      onChange,
+      onSettingsChange,
+      onClose,
+    }));
+    container.querySelector<HTMLButtonElement>('[role="tab"][aria-label="Freebuff"]')!.click();
+    await Promise.resolve();
+  });
+  expect(container.textContent).toContain("No active Freebuff session.");
+  expect(freebuffControl.listFreebuffModels).not.toHaveBeenCalled();
 });
 
 it("updates effort inline and closes with Escape", () => {

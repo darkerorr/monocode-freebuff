@@ -1,10 +1,37 @@
 import type { HarnessId } from "./session";
 import { HARNESSES } from "./session";
 import { loadProjectProviderSettings } from "./projectProviders";
+
 import {
   hasProbedHarnessAvailability,
   isHarnessAvailable,
 } from "../../../integrations/harness/core/availabilityState";
+
+const FREEBUFF_NOT_EXPOSED_INFO = [
+  {
+    label: "plan",
+    note: "Only shown on your Freebuff account page, not by the CLI.",
+  },
+  {
+    label: "tokens",
+    note: "Freebuff exposes an hourly balance, not account tokens or credits.",
+  },
+  {
+    label: "reset time",
+    note: "Freebuff does not print when its balance resets.",
+  },
+];
+
+/**
+ * Values that Freebuff's CLI does not print at all. Used by the settings pane,
+ * the account panel and the session list so the project never invents them.
+ */
+export function freebuffNotExposedInfo(): readonly {
+  label: string;
+  note: string;
+}[] {
+  return FREEBUFF_NOT_EXPOSED_INFO;
+}
 
 export type ModelSettingChoice = {
   value: string;
@@ -35,6 +62,20 @@ export type AgentModel = {
   settings?: ModelSetting[];
   /** Context window, when the harness catalog reports one. */
   contextWindow?: number;
+};
+
+export type FreebuffModel = {
+  name: string;
+  effort: string | null;
+  descriptors: string[];
+  selected: boolean;
+};
+
+/** Stable session identity; the Freebuff CLI chooses the actual model itself. */
+export const FREEBUFF_SESSION_MODEL: AgentModel = {
+  id: "freebuff:session",
+  harness: "freebuff",
+  name: "Freebuff session",
 };
 
 export const MODELS: AgentModel[] = [
@@ -220,6 +261,7 @@ export const DEFAULT_MODEL_ID: Record<HarnessId, string> = {
   hermes: "hermes:default",
   antigravity: "antigravity:gemini-3.8-flash-high",
   devin: "devin:adaptive",
+  freebuff: "",
 };
 
 const FAVORITES_KEY = "monocode.favoriteModels";
@@ -250,6 +292,7 @@ const HARNESS_ORDER: HarnessId[] = [
   "hermes",
   "antigravity",
   "devin",
+  "freebuff",
 ];
 
 const EMPTY_MODELS: AgentModel[] = [];
@@ -429,6 +472,10 @@ export function resolveModel(harness: HarnessId, id?: string): AgentModel {
       );
     }
   }
+  // Freebuff has no external model catalog: this stable identity represents
+  // the provider session, while the CLI controls its active model internally.
+  if (harness === "freebuff") return FREEBUFF_SESSION_MODEL;
+
   // Codex has no built-in catalog. During startup, retain the saved model
   // until discovery finishes instead of borrowing another provider's model.
   if (available.length === 0) {
