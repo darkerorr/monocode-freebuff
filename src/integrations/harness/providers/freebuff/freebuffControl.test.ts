@@ -3,6 +3,7 @@ import type { FreebuffChatSnapshot } from "../../core/child";
 import {
   resetFreebuffForTests,
   getActiveFreebuffSessionId,
+  getActiveFreebuffModel,
   listFreebuffModels,
   selectFreebuffModel,
   startFreebuffSession,
@@ -14,14 +15,16 @@ import {
 
 const boot = "Enter a coding task or / for commands\r\n";
 const footer = (model: string) =>
-  `╯ ${model} • max · ~\\repo · /model to change\r\n`;
-const selectedPicker = (model: string) => [
-  "↑↓ choose model · Tab reasoning · Enter select · Esc cancel",
-  "OPTIMIZED · Strongest price-to-performance models",
-  `│${model === "DeepSeek V4.1 Flash 10/17" ? "›" : " "}DeepSeek V4.1 Flash 10/17 • max · Smart & Fast · Images`,
-  `│${model === "MiMo v2.6 Flash Slow" ? "›" : " "}MiMo v2.6 Flash Slow · Slow · cheapest · Images`,
-].join("\r\n");
-const emptyChat: FreebuffChatSnapshot = { messages: [], size: 2, mtimeMs: 1 };
+  `╯ ${model} • max · ~\\repo · /model to change\r\n`;const emptyChat: FreebuffChatSnapshot = { messages: [], size: 2, mtimeMs: 1 };
+
+function selectedPicker(model: string): string {
+  return [
+    "↑↓ choose model · Tab reasoning · Enter select · Esc cancel",
+    "OPTIMIZED · Strongest price-to-performance models",
+    `│${model === "DeepSeek V4.1 Flash 10/17" ? "›" : " "}DeepSeek V4.1 Flash 10/17 • max · Smart & Fast · Images`,
+    `│${model === "MiMo v2.6 Flash Slow" ? "›" : " "}MiMo v2.6 Flash Slow · Slow · cheapest · Images`,
+  ].join("\r\n");
+}
 
 function makeRuntime(): {
   runtime: FreebuffRuntime;
@@ -63,7 +66,7 @@ function makeRuntime(): {
         active = highlighted;
         pickerOpen = false;
         emit(footer(active));
-      } else if (data === "\u001b") {
+      } else if (data === "\u001b" && pickerOpen) {
         pickerOpen = false;
         // xterm redraws its screen buffer asynchronously; let the callback
         // settle so the adapter sees the updated footer just as it does from
@@ -107,6 +110,10 @@ describe("Freebuff interactive model control", () => {
     expect(getActiveFreebuffSessionId(input.sessionId)).toBe(input.sessionId);
     expect(probe.writes).toEqual([]);
     expect(events).toEqual([]);
+    expect(await getActiveFreebuffModel(input.sessionId)).toEqual({
+      name: "DeepSeek V4.1 Flash 10/17",
+      effort: "max",
+    });
 
     const firstTurnEvents: string[] = [];
     await sendFreebuffTurn({
@@ -159,6 +166,10 @@ describe("Freebuff interactive model control", () => {
     expect(probe.writes).toContain("/model\r");
     expect(probe.writes).toContain("\u001b");
     expect(probe.getActive()).toBe("DeepSeek V4.1 Flash 10/17");
+    expect(await getActiveFreebuffModel("freebuff-control-session")).toEqual({
+      name: "DeepSeek V4.1 Flash 10/17",
+      effort: "max",
+    });
   });
 
   it("rejects an unavailable model without sending a select key", async () => {

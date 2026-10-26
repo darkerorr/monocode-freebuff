@@ -30,6 +30,7 @@ export {
   hasProbedHarnessAvailability,
   isHarnessAvailable,
   subscribeHarnessAvailability,
+  emitFreebuffAvailabilityChanged,
 } from "./availabilityState";
 
 /**
@@ -187,8 +188,10 @@ export function probeHarnessAvailability(
         // Freebuff's terminal UI.
         try {
           await resolveFreebuffBinary();
+          emitFreebuffAvailabilityChanged();
           return [id, true] as const;
         } catch {
+          emitFreebuffAvailabilityChanged();
           return [id, false] as const;
         }
       }

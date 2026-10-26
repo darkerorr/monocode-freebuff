@@ -166,6 +166,7 @@ export {
   isHarnessAvailable,
   probeHarnessAvailability,
   subscribeHarnessAvailability,
+  emitFreebuffAvailabilityChanged,
 } from "./core/availability";
 export {
   getHarness,

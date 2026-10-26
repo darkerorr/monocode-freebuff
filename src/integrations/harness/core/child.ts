@@ -702,6 +702,12 @@ export type FreebuffPtyModelControlRequest =
       data: string;
       resolve: () => void;
       reject: (error: Error) => void;
+    }
+  | {
+      sessionId: string;
+      action: "activeModel";
+      resolve: (model: { name: string; effort: string } | null) => void;
+      reject: (error: Error) => void;
     };
 
 const freebuffPtyModelControlSubscribers = new Set<
@@ -744,9 +750,7 @@ export function requestFreebuffModelChange(
       "No active Freebuff PTY accepted the model change.",
     );
   });
-}
-
-export function requestFreebuffModelChoices(
+}export function requestFreebuffModelChoices(
   sessionId: string,
 ): Promise<FreebuffModelChoice[]> {
   return new Promise<FreebuffModelChoice[]>((resolve, reject) => {
@@ -756,7 +760,16 @@ export function requestFreebuffModelChoices(
     );
   });
 }
-
+export function requestFreebuffActiveModel(
+  sessionId: string,
+): Promise<{ name: string; effort: string } | null> {
+  return new Promise<{ name: string; effort: string } | null>((resolve, reject) => {
+    dispatchFreebuffModelControl(
+      { sessionId, action: "activeModel", resolve, reject },
+      "No active Freebuff PTY accepted the active-model request.",
+    );
+  });
+}
 export function killAllFreebuffPtys(): Promise<void> {
   freebuffPtyReplay.clear();
   return invoke("harness_freebuff_pty_kill_all");

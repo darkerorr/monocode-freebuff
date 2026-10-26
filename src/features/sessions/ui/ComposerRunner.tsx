@@ -477,7 +477,9 @@ export function ComposerRunner({
     };
   }, [boxRef]);
 
-  useEffect(() => wakeRef.current(), [busy, enabled]);
+  useEffect(() => {
+    if (busy && enabled) wakeRef.current();
+  }, [busy, enabled]);
 
   return createPortal(
     <div
