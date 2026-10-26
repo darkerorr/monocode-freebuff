@@ -17,6 +17,7 @@ import {
 import { isLiveHarness } from "./registry";
 import { IS_WIN } from "../../../platform/tauri/platform";
 import {
+  emitFreebuffAvailabilityChanged,
   emitHarnessAvailability,
   harnessAvailabilityProbedAt,
   markHarnessAvailabilityProbed,
