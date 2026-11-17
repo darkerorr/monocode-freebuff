@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 import {
   freebuffSnapshotFromProbe,
+  parseFreebuffModelPicker,
   getFreebuffAccountSnapshot,
   recordFreebuffModelControl,
   parseFreebuffUsageScreen,
@@ -205,5 +206,46 @@ describe("Freebuff terminal facts", () => {
     updateFreebuffAccountFromPty({ kind: "exit", sessionId, code: 0 });
     expect(getFreebuffAccountSnapshot().dailyHours.value).toBeNull();
     expect(getFreebuffAccountSnapshot().model.value).toBeNull();
+  });
+});
+
+/**
+ * The /model picker as Freebuff 0.2.35 renders it under Windows ConPTY, read
+ * from MonoCode's emulated 120x40 screen: one card per model, the hourly
+ * multiplier or "Paid plan" on the card's second line.
+ */
+const CARD_PICKER = [
+  " ↑↓ choose model · Tab reasoning · Enter select · Esc cancel",
+  " PREMIUM · Strongest price-to-performance models",
+  " ┌──────────────────────────────────────────────────────────────────────────────┐",
+  " │ › DeepSeek V4.1 Flash Fast • max · Fastest · Images                          │",
+  " │               3x · Recommended · May use data for AI training                │",
+  " └──────────────────────────────────────────────────────────────────────────────┘",
+  " ┌──────────────────────────────────────────────────────────────────────────────┐",
+  " │   DeepSeek V4.1 Flash • high · Steady speed · Images                         │",
+  " │                      2x · May use data for AI training                       │",
+  " └──────────────────────────────────────────────────────────────────────────────┘",
+  " POWERFUL · Frontier models like GPT-6.1 Sol and more",
+  " ┌──────────────────────────────────────────────────────────────────────────────┐",
+  " │   GPT-6 Luna • high · Strong all-around · Images                             │",
+  " │                                  Paid plan                                   │",
+  " └──────────────────────────────────────────────────────────────────────────────┘",
+  " DeepSeek V4.1 Flash Fast • max · ~\\work\\shop · /model to change · Chat: New chat",
+].join("\n");
+
+describe("Freebuff card model picker", () => {
+  it("reads each card, its hourly multiplier and the paid-plan lock", () => {
+    expect(parseFreebuffModelPicker(CARD_PICKER)).toEqual([
+      { name: "DeepSeek V4.1 Flash Fast", effort: "max", descriptors: ["Fastest", "Images"], selected: true, multiplier: "3x" },
+      { name: "DeepSeek V4.1 Flash", effort: "high", descriptors: ["Steady speed", "Images"], selected: false, multiplier: "2x" },
+      { name: "GPT-6 Luna", effort: "high", descriptors: ["Strong all-around", "Images"], selected: false, locked: true },
+    ]);
+  });
+
+  it("keeps the footer as the active model while the picker is open", () => {
+    expect(parseFreebuffUsageScreen(CARD_PICKER).model).toEqual({
+      name: "DeepSeek V4.1 Flash Fast",
+      effort: "max",
+    });
   });
 });

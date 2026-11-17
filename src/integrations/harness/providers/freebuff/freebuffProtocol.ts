@@ -64,6 +64,57 @@ export function freebuffBootDiagnostics(
 }
 export const FREEBUFF_TOOL_DETAIL_CHARS = 4_000;
 
+/**
+ * Freebuff's footer prints conversation context as `15.8K (2%)`. Convert it to
+ * MonoCode's `{ used, window }`. The window is the one implied by Freebuff's own
+ * percentage, so the meter shows the same fill Freebuff does; below 1% that
+ * ratio is meaningless and only the token count is reported.
+ */
+export function freebuffContextUsage(
+  label: string,
+  percent: number,
+): { used: number; window?: number } | null {
+  const match = /^(\d+(?:\.\d+)?)\s*([KM])?$/i.exec(label.trim());
+  if (!match) return null;
+  const scale = match[2]?.toUpperCase() === "M" ? 1_000_000 : match[2] ? 1_000 : 1;
+  const used = Math.round(Number(match[1]) * scale);
+  if (!Number.isFinite(used) || used <= 0) return null;
+  if (!(percent >= 1 && percent <= 100)) return { used };
+  return { used, window: Math.round((used * 100) / percent) };
+}
+
+const FOCUS_OUT = "\u001b[O";
+const FOCUS_IN = "\u001b[I";
+
+/**
+ * The reply MonoCode's hidden emulator sends back to Freebuff. Freebuff asks
+ * for focus reports (ESC[?1004h); the emulator has no window, so it reports
+ * "focus lost", and Freebuff then drops every key typed into it. The user is
+ * driving Freebuff through MonoCode, so report it as focused instead.
+ */
+export function freebuffTerminalReply(reply: string): string {
+  return reply.split(FOCUS_OUT).join(FOCUS_IN);
+}
+
+/** Collapse the rendered screen to single-spaced text for substring checks. */
+export function freebuffScreenText(screen: string): string {
+  return stripFreebuffAnsi(screen)
+    .replace(/[│┃┌┐└┘─┼┬┴├┤╭╮╰╯▍▏▎▕▌█▀▄▐]/g, " ")
+    .replace(/\s+/g, " ");
+}
+
+/** How many times `needle` appears in `haystack`. */
+export function countOccurrences(haystack: string, needle: string): number {
+  if (!needle) return 0;
+  let count = 0;
+  let index = haystack.indexOf(needle);
+  while (index >= 0) {
+    count += 1;
+    index = haystack.indexOf(needle, index + needle.length);
+  }
+  return count;
+}
+
 const ANSI =
   /\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*\x07|\x1b[()][A-Za-z0-9]/g;
 

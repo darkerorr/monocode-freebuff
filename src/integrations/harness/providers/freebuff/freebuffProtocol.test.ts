@@ -8,6 +8,9 @@ import {
   createFreebuffTurnState,
   freebuffBootDiagnostics,
   freebuffChatId,
+  freebuffContextUsage,
+  countOccurrences,
+  freebuffScreenText,
   freebuffPromptPayload,
   freebuffPtyTail,
   freebuffStartupError,
@@ -289,5 +292,24 @@ describe("Freebuff transcript events", () => {
       { type: "message.completed" },
     ]);
     expect(progress.complete).toBe(true);
+  });
+});
+
+describe("Freebuff footer context", () => {
+  it("turns the footer's token label into MonoCode context usage", () => {
+    expect(freebuffContextUsage("15.8K", 2)).toEqual({ used: 15_800, window: 790_000 });
+    expect(freebuffContextUsage("1.2M", 60)).toEqual({ used: 1_200_000, window: 2_000_000 });
+  });
+
+  it("reports only the token count when the percentage cannot imply a window", () => {
+    expect(freebuffContextUsage("512", 0)).toEqual({ used: 512 });
+    expect(freebuffContextUsage("not a size", 10)).toBeNull();
+  });
+});
+
+describe("Freebuff screen text", () => {
+  it("counts a prompt echo across box borders and repeated spaces", () => {
+    const screen = "│  ▍Fix the tests   │\n╰────╯\n│ Fix the tests │";
+    expect(countOccurrences(freebuffScreenText(screen), "Fix the tests")).toBe(2);
   });
 });

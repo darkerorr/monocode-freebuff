@@ -18,6 +18,7 @@ vi.mock("../../../integrations/harness/core/registry", () => ({
 const freebuffAccountMock = vi.hoisted(() => {
   type ActiveModel = { name: string; effort: string } | null;
   const listeners = new Set<() => void>();
+  const sessionModels = new Map<string, { name: string; effort: string }>();
   const empty = {
     state: "unknown",
     value: null,
@@ -66,6 +67,9 @@ const freebuffAccountMock = vi.hoisted(() => {
       };
       for (const listener of listeners) listener();
     },
+    sessionModels,
+    sessionModel: (sessionId: string | null | undefined) =>
+      sessionId ? sessionModels.get(sessionId) ?? null : null,
     reset: () => {
       snapshot = {
         ...snapshot,
@@ -77,8 +81,19 @@ const freebuffAccountMock = vi.hoisted(() => {
 
 vi.mock("../../providers/model/freebuffAccount", () => ({
   getFreebuffAccountSnapshot: freebuffAccountMock.read,
+  getFreebuffSessionModel: freebuffAccountMock.sessionModel,
   subscribeFreebuffAccount: freebuffAccountMock.subscribe,
 }));
+
+const freebuffStart = vi.hoisted(() => vi.fn(async () => undefined));
+
+vi.mock(
+  "../../../integrations/harness/providers/freebuff/freebuff",
+  async (importOriginal) => ({
+    ...(await importOriginal<object>()),
+    startFreebuffSession: freebuffStart,
+  }),
+);
 
 vi.mock("../../../shared/ui/Popover", () => ({
   Popover: ({
@@ -195,6 +210,58 @@ function inputText(input: HTMLInputElement, value: string) {
     input.dispatchEvent(new Event("input", { bubbles: true }));
   });
 }
+
+describe("Freebuff session terminal", () => {
+  it("opens the focused session's own Freebuff and shows that session's model", async () => {
+    freebuffStart.mockClear();
+    freebuffAccountMock.sessionModels.set("session-a", { name: "DeepSeek V4.1 Flash Fast", effort: "max" });
+    // Another session's terminal painted last; it must not leak into this one.
+    freebuffAccountMock.setModel({ name: "GPT-6.1 Sol", effort: "medium" });
+    await act(async () => {
+      root.render(
+        createElement(ModelPicker, {
+          harness: "freebuff",
+          model: FREEBUFF_SESSION_MODEL.id,
+          values: {},
+          project: "C:\\work\\shop",
+          sessionId: "session-a",
+          hotkeys: true,
+          onChange: vi.fn(),
+          onSettingsChange: vi.fn(),
+        }),
+      );
+      await Promise.resolve();
+    });
+
+    expect(freebuffStart).toHaveBeenCalledTimes(1);
+    expect(freebuffStart).toHaveBeenCalledWith(
+      expect.objectContaining({ sessionId: "session-a", cwd: "C:\\work\\shop" }),
+    );
+    expect(container.textContent).toContain("DeepSeek V4.1 Flash Fast");
+    expect(container.textContent).not.toContain("GPT-6.1 Sol");
+    freebuffAccountMock.sessionModels.clear();
+  });
+
+  it("does not open Freebuff for a session the user is not looking at", async () => {
+    freebuffStart.mockClear();
+    await act(async () => {
+      root.render(
+        createElement(ModelPicker, {
+          harness: "freebuff",
+          model: FREEBUFF_SESSION_MODEL.id,
+          values: {},
+          project: "C:\\work\\shop",
+          sessionId: "background-session",
+          hotkeys: false,
+          onChange: vi.fn(),
+          onSettingsChange: vi.fn(),
+        }),
+      );
+      await Promise.resolve();
+    });
+    expect(freebuffStart).not.toHaveBeenCalled();
+  });
+});
 
 describe("model picker", () => {
   it("opens the Freebuff tab from another provider, shows CLI-owned session content, and selects its stable session id", async () => {

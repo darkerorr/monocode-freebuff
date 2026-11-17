@@ -13,6 +13,8 @@ import type {
   FreebuffPtyModelControlRequest,
 } from "../../core/child";
 import {
+  forgetFreebuffScreen,
+  observeFreebuffScreen,
   parseFreebuffModelPicker,
   parseFreebuffUsageScreen,
   recordFreebuffModelControl,
@@ -31,11 +33,15 @@ import {
   FREEBUFF_SESSION_ERROR,
   FREEBUFF_SUBMIT_KEY,
   FREEBUFF_TURN_TIMEOUT_MS,
+  countOccurrences,
   createFreebuffTurnState,
   freebuffBootDiagnostics,
   freebuffChatId,
+  freebuffContextUsage,
   freebuffPromptEcho,
   freebuffPromptPayload,
+  freebuffScreenText,
+  freebuffTerminalReply,
   freebuffPtyTail,
   freebuffStartupError,
   freebuffTurnProgress,
@@ -79,7 +85,15 @@ type Live = {
   modelControlBusy: boolean;
   startedNotified: boolean;
   screen: Terminal;
+  /** Pending publish of the rendered screen to the account/context views. */
+  screenTimer?: ReturnType<typeof setTimeout>;
+  /** Last context Freebuff showed, re-sent when a turn binds a new listener. */
+  context?: { used: number; window?: number };
+  contextKey: string;
 };
+
+/** Publish the rendered screen at most this often; Ink repaints many times a second. */
+const SCREEN_PUBLISH_MS = 250;
 
 type Resume = { chatId: string; cwd: string };
 
@@ -170,14 +184,18 @@ async function controlFreebuffModel(
     live.modelControlTail = "";
     await writeAndWaitFor(live, "/model", FREEBUFF_MODEL_PICKER_RE, 4_000);
     pickerOpened = true;
-    const choices = await waitForModelChoices(live, 4_000);
+    const visible = await waitForModelChoices(live, 4_000);
     if (request.action === "list") {
+      // The picker only fits a few cards on screen: walk it to read them all,
+      // then Esc, which leaves the active model untouched.
+      const catalog = await readModelCatalog(live, visible);
       await closeModelPicker(live);
       pickerOpened = false;
-      recordFreebuffModelControl(live.sessionId, choices);
-      request.resolve(choices);
+      recordFreebuffModelControl(live.sessionId, catalog.models);
+      request.resolve(catalog.models);
       return;
     }
+    const choices = visible;
     if (request.action === "activeModel") {
       const selectedModel = choices.find((item) => item.selected);
       await closeModelPicker(live);
@@ -198,10 +216,6 @@ async function controlFreebuffModel(
 
     const target = request.data;
     const selected = choices.find((item) => item.selected);
-    const match = choices.find((item) => item.name === target);
-    if (!match) {
-      throw new Error(`Freebuff does not currently offer the model “${target}”.`);
-    }
     if (selected && selected.name === target) {
       await closeModelPicker(live);
       pickerOpened = false;
@@ -212,21 +226,28 @@ async function controlFreebuffModel(
       request.resolve();
       return;
     }
-    const selectedIndex = choices.findIndex((item) => item.name === target);
-    const activeIndex = choices.findIndex((item) => item.selected);
-    if (selectedIndex < 0 || activeIndex < 0) {
+    // The target may sit below the fold: read the whole catalog first.
+    const catalog = choices.some((item) => item.name === target)
+      ? { models: choices, highlighted: selected?.name ?? null }
+      : await readModelCatalog(live, choices);
+    const match = catalog.models.find((item) => item.name === target);
+    if (!match) {
+      throw new Error(`Freebuff does not currently offer the model “${target}”.`);
+    }
+    if (match.locked) {
+      throw new Error(`“${target}” needs a Freebuff paid plan. Choose it in Freebuff after upgrading.`);
+    }
+    const targetIndex = catalog.models.findIndex((item) => item.name === target);
+    let currentIndex = catalog.models.findIndex((item) => item.name === catalog.highlighted);
+    if (currentIndex < 0) {
       throw new Error("Freebuff's current model-picker selection could not be confirmed.");
     }
-    // Move relative to the observed selected option. Each key is followed by
-    // a fresh screen parse, never a guessed model-row position.
-    let currentIndex = activeIndex;
-    const direction = selectedIndex >= currentIndex ? 1 : -1;
-    const steps = Math.abs(selectedIndex - currentIndex);
-    for (let index = 0; index < steps; index += 1) {
-      const previousTail = live.modelControlTail;
-      await runtime.write(live.sessionId, direction > 0 ? "\u001b[B" : "\u001b[A");
-      const next = await waitForSelectedPickerModel(live, 1_500, previousTail);
-      const nextIndex = choices.findIndex((item) => item.name === next);
+    // Move one row at a time towards the target. Each key is followed by a
+    // fresh screen parse, never a guessed model-row position.
+    for (let step = 0; currentIndex !== targetIndex && step <= catalog.models.length * 2; step += 1) {
+      await runtime.write(live.sessionId, targetIndex > currentIndex ? "\u001b[B" : "\u001b[A");
+      const next = await waitForHighlightChange(live, catalog.models[currentIndex].name, 1_500);
+      const nextIndex = next ? catalog.models.findIndex((item) => item.name === next) : -1;
       if (nextIndex < 0 || nextIndex === currentIndex) {
         throw new Error("Freebuff did not confirm the model-picker navigation.");
       }
@@ -244,7 +265,7 @@ async function controlFreebuffModel(
     if (!after || after.name !== target || (before?.name === target && selected?.name !== target)) {
       throw new Error("Freebuff did not confirm the requested active model.");
     }
-    recordFreebuffModelControl(live.sessionId, choices, after);
+    recordFreebuffModelControl(live.sessionId, catalog.models, after);
     request.resolve();
   } catch (error) {
     if (pickerOpened && !live.cancelled && !live.stopping && live.exited === undefined) {
@@ -254,6 +275,78 @@ async function controlFreebuffModel(
   } finally {
     if (claimedControl) live.modelControlBusy = false;
   }
+}
+
+/** Most models Freebuff has ever listed is ~15; leave room without looping forever. */
+const MAX_PICKER_ROWS = 40;
+
+/**
+ * Walk Freebuff's picker with ↓ to read every card, merging each visible frame
+ * into one ordered list. Stops when the highlight stops moving or comes back to
+ * a row it already visited (the list wrapped). `selected` stays on the model
+ * that was active when the picker opened; the highlight is only a cursor.
+ */
+async function readModelCatalog(
+  live: Live,
+  visible: FreebuffModel[],
+): Promise<{ models: FreebuffModel[]; highlighted: string | null }> {
+  const active = visible.find((item) => item.selected)?.name ?? null;
+  const models: FreebuffModel[] = [];
+  const merge = (frame: FreebuffModel[]) => {
+    let insertAt = 0;
+    for (const item of frame) {
+      const known = models.findIndex((entry) => entry.name === item.name);
+      if (known >= 0) {
+        // A later frame may show the card's second line that an earlier one cut.
+        models[known] = {
+          ...models[known],
+          multiplier: models[known].multiplier ?? item.multiplier,
+          locked: models[known].locked || item.locked,
+        };
+        insertAt = known + 1;
+      } else {
+        models.splice(insertAt, 0, { ...item });
+        insertAt += 1;
+      }
+    }
+  };
+  merge(visible);
+  let highlighted = active;
+  const visited = new Set(highlighted ? [highlighted] : []);
+  for (let step = 0; step < MAX_PICKER_ROWS; step += 1) {
+    await runtime.write(live.sessionId, "\u001b[B");
+    const next = await waitForHighlightChange(live, highlighted, 1_500);
+    if (!next) break; // The highlight did not move: it is on the last row.
+    merge(parseFreebuffModelPicker(live.modelControlTail));
+    highlighted = next;
+    if (visited.has(next)) break; // Wrapped back to the top.
+    visited.add(next);
+  }
+  return {
+    models: models.map((item) => ({ ...item, selected: item.name === active })),
+    highlighted,
+  };
+}
+
+/**
+ * Wait for the picker's highlight to land on a different model. An unrelated
+ * repaint (timer, rotating ad) does not count. Null when it never moves.
+ */
+async function waitForHighlightChange(
+  live: Live,
+  from: string | null,
+  timeoutMs: number,
+): Promise<string | null> {
+  const deadline = runtime.now() + timeoutMs;
+  while (runtime.now() <= deadline) {
+    if (live.cancelled || live.stopping || live.exited !== undefined) {
+      throw new Error("Freebuff closed while the model picker was open.");
+    }
+    const current = parseFreebuffModelPicker(live.modelControlTail).find((item) => item.selected);
+    if (current && current.name !== from) return current.name;
+    await runtime.delay(40);
+  }
+  return null;
 }
 
 async function closeModelPicker(live: Live): Promise<void> {
@@ -281,9 +374,24 @@ async function writeAndWaitFor(
   timeoutMs: number,
 ): Promise<void> {
   live.output = "";
-  await runtime.write(live.sessionId, `${data}\r`);
+  // Freebuff's command menu swallows an Enter that arrives in the same burst
+  // as the command text (measured on 0.2.35 under ConPTY): type the command,
+  // let the composer show it, then press Enter on its own.
+  // The footer always reads "/model to change": count, don't just look.
+  const shown = () => countOccurrences(freebuffScreenText(live.modelControlTail), data);
+  const before = shown();
+  await runtime.write(live.sessionId, data);
+  const typedBy = runtime.now() + 1_500;
+  while (runtime.now() <= typedBy && shown() <= before) {
+    await runtime.delay(40);
+  }
+  await runtime.delay(FREEBUFF_COMMAND_SETTLE_MS);
+  await runtime.write(live.sessionId, "\r");
   await waitForText(live, marker, timeoutMs);
 }
+
+/** Pause between a typed command and its Enter, so the menu has settled. */
+const FREEBUFF_COMMAND_SETTLE_MS = 200;
 
 async function waitForText(
   live: Live,
@@ -379,14 +487,23 @@ export function setFreebuffRuntimeForTests(next: FreebuffRuntime): void {
   runtime = next;
 }
 
-/** Return a running Freebuff PTY, preferring the session whose picker is open. */
-export function getActiveFreebuffSessionId(preferredSessionId?: string): string | null {
-  const preferred = preferredSessionId ? liveByThread.get(preferredSessionId) : null;
-  if (preferred && !preferred.cancelled && !preferred.stopping && preferred.exited === undefined) {
-    return preferred.sessionId;
-  }
+/**
+ * Return a running Freebuff PTY the caller may control. A named session is the
+ * only answer when it is running. Without one, only a session in the same
+ * project qualifies: borrowing another project's terminal would restart that
+ * conversation in this folder and change its model.
+ */
+export function getActiveFreebuffSessionId(
+  preferredSessionId?: string,
+  cwd?: string,
+): string | null {
+  const running = (live: Live | undefined): live is Live =>
+    !!live && !live.cancelled && !live.stopping && live.exited === undefined;
+  const preferred = preferredSessionId ? liveByThread.get(preferredSessionId) : undefined;
+  if (running(preferred)) return preferred.sessionId;
+  if (preferredSessionId) return null;
   const sessions = [...liveByThread.values()].filter(
-    (live) => !live.cancelled && !live.stopping && live.exited === undefined,
+    (live) => running(live) && (cwd == null || live.cwd === cwd),
   );
   return sessions[sessions.length - 1]?.sessionId ?? null;
 }
@@ -510,6 +627,8 @@ export async function sendFreebuffTurn(input: SendTurnInput): Promise<void> {
     input.onEvent({ type: "session.providerBound", providerSessionId: live.chatId });
     input.onEvent({ type: "session.started" });
   }
+  // The footer may have shown context before this listener was attached.
+  if (live.context) input.onEvent({ type: "context", ...live.context });
   await runTurn(live, input);
 }
 
@@ -530,6 +649,7 @@ export async function cancelFreebuffTurn(sessionId: string): Promise<void> {
   }
   liveByThread.delete(sessionId);
   startupByThread.delete(sessionId);
+  clearScreenPublish(live);
   live.screen.dispose();
   live.cancelled = true;
   live.bootReject?.(new FreebuffCancelledError());
@@ -549,6 +669,7 @@ export async function stopFreebuffSession(sessionId: string): Promise<void> {
     return;
   }
   live.stopping = true;
+  clearScreenPublish(live);
   live.screen.dispose();
   live.bootReject?.(new FreebuffCancelledError());
   live.turn?.resolve();
@@ -666,6 +787,7 @@ async function ensureLiveOnce(input: HarnessSessionInput): Promise<Live> {
     modelControlTail: "",
     modelControlBusy: false,
     startedNotified: false,
+    contextKey: "",
     screen: new Terminal({ cols: 120, rows: 40, scrollback: 0 }),
     cancelled: false,
     stopping: false,
@@ -674,6 +796,15 @@ async function ensureLiveOnce(input: HarnessSessionInput): Promise<Live> {
     resolvedArgs: ["--cwd", input.cwd, "--continue", chatId],
   };
   liveByThread.set(input.sessionId, live);
+  // Answer the terminal's own queries the way a real terminal does. Windows
+  // ConPTY is created here with "inherit cursor": it asks for the cursor
+  // position (ESC[6n) and paints nothing until it gets an answer, so without
+  // this reply Freebuff's screen never appears. The emulator also answers
+  // device-attribute probes the TUI sends at startup.
+  live.screen.onData((reply) => {
+    if (live.stopping || live.cancelled || live.exited !== undefined) return;
+    void runtime.write(live.sessionId, freebuffTerminalReply(reply)).catch(() => undefined);
+  });
   runtime.watch(
     input.sessionId,
     (data) => onPtyData(live, data),
@@ -749,6 +880,7 @@ async function reserveChat(cwd: string): Promise<string> {
 function onPtyData(live: Live, data: string): void {
   live.output = (live.output + data).slice(-OUTPUT_TAIL_CHARS);
   live.screen.write(data, () => {
+    if (live.stopping || live.cancelled) return;
     const buffer = live.screen.buffer.active;
     const rows: string[] = [];
     for (let row = 0; row < buffer.length; row += 1) {
@@ -756,6 +888,12 @@ function onPtyData(live: Live, data: string): void {
       rows.push(line);
     }
     live.modelControlTail = rows.join("\n");
+    // ConPTY sends only changed cells, so the raw stream can lose letters of
+    // the marker; the emulated screen always holds the whole prompt line.
+    if (live.bootResolve && FREEBUFF_BOOT_MARKER.test(live.modelControlTail)) {
+      live.bootResolve();
+    }
+    scheduleScreenPublish(live);
   });
   // A turn that never started can fail on a banner (quota, sign-in) instead of
   // opening a chat; report it now rather than waiting out the prompt timeout.
@@ -778,7 +916,43 @@ function onPtyData(live: Live, data: string): void {
   }
 }
 
+function scheduleScreenPublish(live: Live): void {
+  if (live.screenTimer) return;
+  live.screenTimer = setTimeout(() => {
+    live.screenTimer = undefined;
+    if (live.stopping || live.cancelled || live.exited !== undefined) return;
+    publishScreen(live);
+  }, SCREEN_PUBLISH_MS);
+}
+
+/**
+ * Show what Freebuff's own footer shows: the active model in the account and
+ * picker views, and the conversation context in the session's context meter.
+ * Only values Freebuff actually painted are reported.
+ */
+function publishScreen(live: Live): void {
+  const screen = live.modelControlTail;
+  if (!screen) return;
+  observeFreebuffScreen(live.sessionId, screen);
+  const read = parseFreebuffUsageScreen(screen);
+  if (!read.context) return;
+  const usage = freebuffContextUsage(read.context.label, read.context.percent);
+  if (!usage) return;
+  const key = `${usage.used}/${usage.window ?? ""}`;
+  if (key === live.contextKey) return;
+  live.contextKey = key;
+  live.context = usage;
+  if (live.startedNotified) live.onEvent({ type: "context", ...usage });
+}
+
+function clearScreenPublish(live: Live): void {
+  if (live.screenTimer) clearTimeout(live.screenTimer);
+  live.screenTimer = undefined;
+  forgetFreebuffScreen(live.sessionId);
+}
+
 function onPtyExit(live: Live, code: number | null): void {
+  clearScreenPublish(live);
   live.exited = code;
   if (live.bootWaiter && live.bootReject) {
     const diagnostic = freebuffBootDiagnostics(
@@ -870,7 +1044,12 @@ function waitForBoot(live: Live): Promise<void> {
       );
       return;
     }
-    if (FREEBUFF_BOOT_MARKER.test(stripFreebuffAnsi(live.output))) finish();
+    if (
+      FREEBUFF_BOOT_MARKER.test(stripFreebuffAnsi(live.output)) ||
+      FREEBUFF_BOOT_MARKER.test(live.modelControlTail)
+    ) {
+      finish();
+    }
   });
 }
 
@@ -908,9 +1087,16 @@ async function runTurn(live: Live, input: SendTurnInput): Promise<void> {
       return;
     }
     const prompt = promptWithAttachments(input.text, input.attachments);
+    // Measure the echo against this turn only: the same words may already be
+    // on screen (an earlier identical prompt in the chat history).
+    const echoBaseline = countOccurrences(
+      freebuffScreenText(live.modelControlTail),
+      freebuffPromptEcho(prompt),
+    );
+    live.output = "";
     await runtime.write(live.sessionId, payload);
     // The composer echoing the paste is the only proof it accepted the text.
-    const echoed = await waitForPromptEcho(live, prompt);
+    const echoed = await waitForPromptEcho(live, prompt, echoBaseline);
     if (live.cancelled || live.stopping) throw new FreebuffCancelledError();
     if (!echoed) {
       throw new Error("Freebuff did not accept the pasted prompt. Please retry.");
@@ -1020,9 +1206,27 @@ async function pollTurn(live: Live, turn: Turn): Promise<void> {
   }
 }
 
-async function waitForPromptEcho(live: Live, text: string): Promise<boolean> {
+async function waitForPromptEcho(
+  live: Live,
+  text: string,
+  screenBaseline = 0,
+): Promise<boolean> {
   const echo = freebuffPromptEcho(text);
   if (!echo) return true;
+  // Terminal composers commonly fold a long paste into a placeholder such as
+  // "[Pasted text #1 +20 lines]" instead of echoing it.
+  const pasteBaseline = countOccurrences(
+    freebuffScreenText(live.modelControlTail).toLowerCase(),
+    "pasted",
+  );
+  const echoed = () => {
+    const screen = freebuffScreenText(live.modelControlTail);
+    return (
+      stripFreebuffAnsi(live.output).includes(echo) ||
+      countOccurrences(screen, echo) > screenBaseline ||
+      countOccurrences(screen.toLowerCase(), "pasted") > pasteBaseline
+    );
+  };
   const attempts = Math.ceil(FREEBUFF_ECHO_TIMEOUT_MS / 50);
   for (let attempt = 0; attempt < attempts; attempt += 1) {
     if (live.cancelled || live.stopping || live.exited !== undefined) {
@@ -1049,7 +1253,7 @@ async function waitForPromptEcho(live: Live, text: string): Promise<boolean> {
       }
       return false;
     }
-    if (stripFreebuffAnsi(live.output).includes(echo)) return true;
+    if (echoed()) return true;
     await runtime.delay(50);
   }
   return false;

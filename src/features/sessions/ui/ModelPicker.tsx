@@ -48,6 +48,7 @@ import {
 import { useModelSource, type ModelSource } from "./modelSource";
 import {
   getFreebuffAccountSnapshot,
+  getFreebuffSessionModel,
   subscribeFreebuffAccount,
   type FreebuffAccountSnapshot,
 } from "../../providers/model/freebuffAccount";
@@ -376,7 +377,9 @@ function FreebuffSessionContent({
           "Freebuff is unavailable for this project. Enable the provider to start its session.",
         );
       }
-      const sessionId = preferredSessionId ?? getActiveFreebuffSessionId();
+      // Never borrow a terminal from another project: starting it here would
+      // restart that conversation in this folder.
+      const sessionId = preferredSessionId ?? getActiveFreebuffSessionId(undefined, cwd);
       if (!sessionId) {
         throw new Error("No MonoCode session is available to own the Freebuff terminal.");
       }
@@ -411,7 +414,7 @@ function FreebuffSessionContent({
 
   return (
     <div className="p-2">
-      <FreebuffModelDisplay account={account} />
+      <FreebuffModelDisplay account={account} sessionId={preferredSessionId} />
       <div className="mt-2 flex items-center justify-between gap-2">
         <p className="text-[11px] leading-relaxed text-content/45">
           Models are read live from Freebuff&apos;s own <code>/model</code> picker.
@@ -537,14 +540,28 @@ function FreebuffSessionContent({
 }
 
 /** Freebuff's model selector belongs to the CLI, not MonoCode's catalog. */
+/**
+ * The model a Freebuff session runs. Its own terminal wins once it has painted
+ * its footer. Before that, Freebuff starts every session on the model it saved
+ * last, which is the one its terminals last reported.
+ */
+function freebuffModelFor(
+  account: FreebuffAccountSnapshot | undefined,
+  sessionId: string | undefined,
+): { name: string; effort: string } | null {
+  return (sessionId ? getFreebuffSessionModel(sessionId) : null) ?? account?.model.value ?? null;
+}
+
 function FreebuffModelDisplay({
   labelClassName = "",
   account,
+  sessionId,
 }: {
   labelClassName?: string;
   account: FreebuffAccountSnapshot;
+  sessionId?: string;
 }) {
-  const model = account.model.value;
+  const model = freebuffModelFor(account, sessionId);
 
   return (
     <span
@@ -581,7 +598,34 @@ export function ModelPicker(props: Props) {
 
 function FreebuffAwareModelPicker(props: Props) {
   const account = useFreebuffAccount();
+  useFreebuffWarmStart(props.sessionId, props.project, props.hotkeys === true);
   return <CatalogModelPicker {...props} freebuffAccount={account} />;
+}
+
+/**
+ * Freebuff only reports its model, balance and context from its own terminal.
+ * Open that terminal as soon as the user looks at a Freebuff session (the
+ * focused pane), under the session's own id, so the first message reuses it.
+ * Opening it is free: Freebuff starts the paid session on the first message.
+ */
+function useFreebuffWarmStart(
+  sessionId: string | undefined,
+  cwd: string | undefined,
+  active: boolean,
+): void {
+  useEffect(() => {
+    if (!active || !sessionId || !cwd) return;
+    void startFreebuffSession({
+      sessionId,
+      cwd,
+      model: FREEBUFF_SESSION_MODEL.id,
+      runtimeMode: "supervised",
+      onEvent: () => undefined,
+    }).catch((error: unknown) => {
+      // The first message reports the same failure in the conversation.
+      console.debug("[monocode] Freebuff warm start failed", error);
+    });
+  }, [active, sessionId, cwd]);
 }
 
 /** Model selection and settings control shared by the composer and session toolbar. */
@@ -648,7 +692,7 @@ function CatalogModelPicker({
   recentOpenRef.current = recentMenu != null;
 
   const resolvedCurrent = source.resolve(harness, model);
-  const freebuffActiveModel = freebuffAccount?.model.value ?? null;
+  const freebuffActiveModel = freebuffModelFor(freebuffAccount, sessionId);
   const current =
     harness === "freebuff"
       ? {

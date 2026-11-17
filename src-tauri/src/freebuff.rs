@@ -30,35 +30,120 @@ const MAX_TOOL_OUTPUT_CHARS: usize = 16_000;
 const TERMINAL_ROWS: u16 = 40;
 const TERMINAL_COLS: u16 = 120;
 
+/// npm installs Freebuff on Windows as a `.cmd` shim whose only job is
+/// `node <dir>\node_modules\freebuff\index.js %*`. CreateProcessW cannot start
+/// a batch file, and wrapping it in `cmd.exe /S /C "…"` does not survive the
+/// PTY layer: portable-pty re-quotes every argument with MSVCRT rules, so the
+/// inner quotes reach cmd.exe as `\"`, which cmd does not understand ("… is not
+/// recognized as an internal or external command"). Run the same official npm
+/// launcher the shim runs, with the same Node choice, and let the PTY quote each
+/// argument for Node itself. No cmd.exe also means no `&`/`%` interpretation of
+/// a project path.
 #[cfg(windows)]
-fn freebuff_pty_command(command: &str, args: &[String]) -> (String, Vec<String>) {
+fn freebuff_pty_command(
+    command: &str,
+    args: &[String],
+    search_path: &str,
+) -> Result<(String, Vec<String>), String> {
     let lower = command.to_ascii_lowercase();
     if !lower.ends_with(".cmd") && !lower.ends_with(".bat") {
-        return (command.to_string(), args.to_vec());
+        return Ok((command.to_string(), args.to_vec()));
     }
-
-    // npm installs on Windows expose Freebuff as a `.cmd` shim. CreateProcessW
-    // cannot launch that shell script directly; run it via cmd.exe so its Node
-    // launcher can start the bundled Freebuff terminal binary.
-    let inner_command = std::iter::once(format!("\"{}\"", command))
-        .chain(args.iter().map(|argument| windows_cmd_argument(argument)))
-        .collect::<Vec<_>>()
-        .join(" ");
-    // /S requires one outer quote pair around the /C command string when the
-    // batch path itself is quoted (the canonical form is: cmd /s /c ""path" args").
-    let command_line = format!("\"{inner_command}\"");
-    (
-        "cmd.exe".to_string(),
-        vec!["/D".into(), "/S".into(), "/C".into(), command_line],
-    )
+    let shim_dir = Path::new(command)
+        .parent()
+        .ok_or_else(|| "Could not locate the Freebuff npm install.".to_string())?;
+    let script = shim_dir
+        .join("node_modules")
+        .join("freebuff")
+        .join("index.js");
+    if !script.is_file() {
+        return Err(format!(
+            "The Freebuff npm launcher is missing ({}). Reinstall it with `npm install -g freebuff`.",
+            script.display()
+        ));
+    }
+    // The shim prefers a node.exe installed next to it, then PATH.
+    let bundled = shim_dir.join("node.exe");
+    let node = if bundled.is_file() {
+        bundled
+    } else {
+        std::env::split_paths(search_path)
+            .map(|dir| dir.join("node.exe"))
+            .find(|candidate| candidate.is_file())
+            .ok_or_else(|| {
+                "Freebuff needs Node.js, but node.exe was not found on PATH.".to_string()
+            })?
+    };
+    let launcher_args = std::iter::once(script.to_string_lossy().into_owned())
+        .chain(args.iter().cloned())
+        .collect();
+    Ok((node.to_string_lossy().into_owned(), launcher_args))
 }
 
-#[cfg(windows)]
-fn windows_cmd_argument(argument: &str) -> String {
-    if argument.contains([' ', '\t', '"']) {
-        format!("\"{}\"", argument.replace('"', "\\\""))
-    } else {
-        argument.to_string()
+/// The PTY hands back arbitrary byte slices, so a multi-byte UTF-8 character
+/// (box glyphs, `›`, accented prompt text) can straddle two reads. Decoding
+/// each read on its own turns both halves into U+FFFD and breaks every marker
+/// the adapter looks for. Carry an incomplete trailing sequence to the next read.
+#[derive(Default)]
+struct Utf8Stream {
+    pending: Vec<u8>,
+}
+
+impl Utf8Stream {
+    fn decode(&mut self, bytes: &[u8]) -> String {
+        self.pending.extend_from_slice(bytes);
+        let mut text = String::new();
+        loop {
+            match std::str::from_utf8(&self.pending) {
+                Ok(valid) => {
+                    text.push_str(valid);
+                    self.pending.clear();
+                    return text;
+                }
+                Err(error) => {
+                    let valid = error.valid_up_to();
+                    text.push_str(
+                        std::str::from_utf8(&self.pending[..valid]).unwrap_or_default(),
+                    );
+                    match error.error_len() {
+                        // Truncated at the end: keep it for the next read.
+                        None => {
+                            self.pending.drain(..valid);
+                            return text;
+                        }
+                        // Genuinely invalid bytes: replace them and go on.
+                        Some(bad) => {
+                            text.push('\u{FFFD}');
+                            self.pending.drain(..valid + bad);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod utf8_stream_tests {
+    use super::Utf8Stream;
+
+    #[test]
+    fn joins_a_character_split_across_reads() {
+        let bytes = "é › │".as_bytes();
+        let mut stream = Utf8Stream::default();
+        let mut text = String::new();
+        for chunk in bytes.chunks(1) {
+            text.push_str(&stream.decode(chunk));
+        }
+        assert_eq!(text, "é › │");
+    }
+
+    #[test]
+    fn replaces_invalid_bytes_without_stalling() {
+        let mut stream = Utf8Stream::default();
+        assert_eq!(stream.decode(b"a\xffb"), "a\u{FFFD}b");
+        assert_eq!(stream.decode(b"\xe2\x94"), "");
+        assert_eq!(stream.decode(b"\x82c"), "│c");
     }
 }
 
@@ -67,23 +152,62 @@ mod windows_launch_tests {
     use super::freebuff_pty_command;
 
     #[test]
-    fn runs_npm_cmd_shim_through_cmd_with_original_cli_arguments() {
-        let command = r"C:\Users\ROOT\AppData\Roaming\npm\freebuff.cmd";
+    fn runs_the_npm_launcher_with_node_instead_of_cmd() {
+        let root = std::env::temp_dir().join(format!("monocode fb & 100% {}", std::process::id()));
+        let npm = root.join("npm");
+        let package = npm.join("node_modules").join("freebuff");
+        let node_dir = root.join("node");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::create_dir_all(&node_dir).unwrap();
+        std::fs::write(package.join("index.js"), b"").unwrap();
+        std::fs::write(node_dir.join("node.exe"), b"").unwrap();
+        let shim = npm.join("freebuff.cmd");
+        std::fs::write(&shim, b"@echo off").unwrap();
+        let cwd = r"C:\Users\Someone\R&D 100%\app".to_string();
         let args = vec![
             "--cwd".to_string(),
-            r"C:\Users\ROOT\Music\monocode".to_string(),
+            cwd.clone(),
             "--continue".to_string(),
             "2026-10-25T00-13-03.784Z".to_string(),
         ];
 
-        let (program, wrapped_args) = freebuff_pty_command(command, &args);
+        let (program, launcher_args) = freebuff_pty_command(
+            shim.to_str().unwrap(),
+            &args,
+            node_dir.to_str().unwrap(),
+        )
+        .unwrap();
 
-        assert_eq!(program, "cmd.exe");
-        assert_eq!(wrapped_args[..3], ["/D", "/S", "/C"]);
-        assert_eq!(
-            wrapped_args[3],
-            format!("\"\"{command}\" --cwd \"{}\" --continue {}\"", args[1], args[3])
-        );
+        assert_eq!(Path::new(&program), node_dir.join("node.exe"));
+        assert_eq!(Path::new(&launcher_args[0]), package.join("index.js"));
+        // Arguments are passed through untouched: the PTY quotes them for Node.
+        assert_eq!(launcher_args[1..], args[..]);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn prefers_node_installed_next_to_the_shim() {
+        let root = std::env::temp_dir().join(format!("monocode-fb-local-{}", std::process::id()));
+        let package = root.join("node_modules").join("freebuff");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(package.join("index.js"), b"").unwrap();
+        std::fs::write(root.join("node.exe"), b"").unwrap();
+        let shim = root.join("freebuff.cmd");
+
+        let (program, _) = freebuff_pty_command(shim.to_str().unwrap(), &[], "").unwrap();
+
+        assert_eq!(Path::new(&program), root.join("node.exe"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn reports_a_missing_launcher_instead_of_starting_cmd() {
+        let root = std::env::temp_dir().join(format!("monocode-fb-missing-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let shim = root.join("freebuff.cmd");
+        let error = freebuff_pty_command(shim.to_str().unwrap(), &[], "").unwrap_err();
+        assert!(error.contains("npm install -g freebuff"));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -92,10 +216,12 @@ mod windows_launch_tests {
         let args = vec!["--continue".to_string(), "chat-id".to_string()];
 
         assert_eq!(
-            freebuff_pty_command(command, &args),
+            freebuff_pty_command(command, &args, "").unwrap(),
             (command.to_string(), args)
         );
     }
+
+    use std::path::Path;
 }
 
 #[derive(Serialize, Clone)]
@@ -219,7 +345,12 @@ fn valid_chat_id(chat_id: &str) -> bool {
         && chat_id != ".."
         && chat_id
             .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+            // `:` would name an NTFS alternate data stream on Windows.
+            .all(|byte| {
+                byte.is_ascii_alphanumeric()
+                    || matches!(byte, b'-' | b'_' | b'.')
+                    || (byte == b':' && !cfg!(windows))
+            })
 }
 
 fn chat_path(cwd: &str, chat_id: &str) -> Result<PathBuf, String> {
@@ -504,17 +635,19 @@ pub fn harness_freebuff_pty_kill_all(host: State<'_, FreebuffPtyHost>) -> Result
     Ok(())
 }
 
-fn emit_data(app: &AppHandle, session_id: &str, bytes: &[u8]) {
+fn emit_data(app: &AppHandle, session_id: &str, stream: &mut Utf8Stream, bytes: &[u8]) {
     if bytes.is_empty() {
         return;
     }
-
-    let text = String::from_utf8_lossy(bytes);
+    let text = stream.decode(bytes);
+    if text.is_empty() {
+        return;
+    }
     app.emit(
         DATA_EVENT,
         FreebuffPtyData {
             session_id: session_id.to_owned(),
-            data: text.into_owned(),
+            data: text,
         },
     )
     .ok();
@@ -609,10 +742,11 @@ mod pty {
         thread::spawn(move || {
             let mut reader = reader;
             let mut buffer = vec![0; READ_CHUNK];
+            let mut stream = Utf8Stream::default();
             loop {
                 match reader.read(&mut buffer) {
                     Ok(0) => break,
-                    Ok(length) => emit_data(&data_app, &data_id, &buffer[..length]),
+                    Ok(length) => emit_data(&data_app, &data_id, &mut stream, &buffer[..length]),
                     Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
                     Err(_) => break,
                 }
@@ -658,11 +792,12 @@ mod pty {
                 pixel_height: 0,
             })
             .map_err(|error| format!("Failed to open Freebuff terminal: {error}"))?;
-        let (program, child_args) = freebuff_pty_command(command, args);
+        let search_path = crate::harness::gui_search_path();
+        let (program, child_args) = freebuff_pty_command(command, args, &search_path)?;
         let mut builder = CommandBuilder::new(program);
         builder.args(child_args);
         builder.cwd(workdir);
-        builder.env("PATH", crate::harness::gui_search_path());
+        builder.env("PATH", &search_path);
         builder.env("TERM", "xterm-256color");
         builder.env("COLORTERM", "truecolor");
         builder.env("COLORFGBG", "15;0");
@@ -705,12 +840,13 @@ mod pty {
         thread::spawn(move || {
             let mut reader = reader;
             let mut buffer = vec![0; READ_CHUNK];
+            let mut stream = Utf8Stream::default();
             loop {
                 match reader.read(&mut buffer) {
                     Ok(0) => break,
                     Ok(length) => {
                         thread::sleep(PTY_COALESCE);
-                        emit_data(&data_app, &data_id, &buffer[..length]);
+                        emit_data(&data_app, &data_id, &mut stream, &buffer[..length]);
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
                     Err(_) => break,

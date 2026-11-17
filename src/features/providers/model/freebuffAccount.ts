@@ -26,6 +26,10 @@ export type FreebuffModel = {
   effort: string | null;
   descriptors: string[];
   selected: boolean;
+  /** Hours of balance one hour of this model costs, as Freebuff prints it ("3x"). */
+  multiplier?: string;
+  /** Freebuff lists it but requires a paid plan; selecting it opens the plans page. */
+  locked?: boolean;
 };
 
 export type FreebuffDailyHours = { remaining: number; limit: number };
@@ -198,6 +202,20 @@ export function parseFreebuffModelPicker(text: string): FreebuffModel[] {
     const selected = line.startsWith("›");
     const body = selected ? line.slice(1).trim() : line;
     if (!body || /choose model|enter select|esc cancel/i.test(body)) continue;
+    // Freebuff 0.2.35+ draws each model as a card whose second line carries
+    // the hourly multiplier ("3x · Recommended · …") or "Paid plan".
+    const previous = models[models.length - 1];
+    if (previous && !selected && !/•/.test(body)) {
+      if (/^paid plan\b/i.test(body)) {
+        previous.locked = true;
+        continue;
+      }
+      const multiplier = /^(\d+(?:\.\d+)?x)\b/i.exec(body);
+      if (multiplier) {
+        previous.multiplier ??= multiplier[1].toLowerCase();
+        continue;
+      }
+    }
     const bullet = body.search(/[•·]/);
     if (bullet < 0) continue;
     const name = body.slice(0, bullet).trim();
@@ -254,7 +272,7 @@ function publish(next: FreebuffAccountSnapshot): void {
 }
 
 export function recordFreebuffModelControl(
-  _sessionId: string,
+  sessionId: string,
   models: FreebuffModel[],
   activeModel?: { name: string; effort: string },
 ): void {
@@ -263,6 +281,7 @@ export function recordFreebuffModelControl(
   const confirmed = activeModel ?? (selected
     ? { name: selected.name, effort: selected.effort ?? "" }
     : undefined);
+  if (confirmed) sessionModels.set(sessionId, confirmed);
   const choices = confirmed
     ? models.map((item) => ({ ...item, selected: item.name === confirmed.name }))
     : models;
@@ -327,8 +346,41 @@ function visibleTerminalText(text: string): string {
   return lines.join("\n");
 }
 
+/**
+ * Sessions whose adapter renders the PTY through a terminal emulator and hands
+ * us the finished screen. ConPTY sends only the cells that changed, so the raw
+ * stream with escape codes stripped loses characters ("Your first message"
+ * arrives as "Yurfirst message"); the rendered screen does not. Once a session
+ * reports its screen, the raw stream is ignored for it.
+ */
+const screenSessions = new Set<string>();
+const sessionModels = new Map<string, { name: string; effort: string }>();
+
+/** The model the given session's own Freebuff terminal last showed. */
+export function getFreebuffSessionModel(
+  sessionId: string | null | undefined,
+): { name: string; effort: string } | null {
+  return sessionId ? sessionModels.get(sessionId) ?? null : null;
+}
+
+/** Record the complete, rendered Freebuff screen of one session. */
+export function observeFreebuffScreen(sessionId: string, screen: string): void {
+  screenSessions.add(sessionId);
+  terminalBySession.delete(sessionId);
+  applyTerminalRead(sessionId, screen);
+}
+
+/** The session's terminal is gone; stop attributing a model to it. */
+export function forgetFreebuffScreen(sessionId: string): void {
+  screenSessions.delete(sessionId);
+  sessionModels.delete(sessionId);
+}
+
 export function updateFreebuffAccountFromPty(event: FreebuffPtyEvent): void {
+  if (event.kind === "data" && screenSessions.has(event.sessionId)) return;
   if (event.kind === "exit") {
+    sessionModels.delete(event.sessionId);
+    screenSessions.delete(event.sessionId);
     if (!terminalBySession.delete(event.sessionId)) return;
     const entries = [...terminalBySession.entries()];
     const remaining = entries[entries.length - 1];
@@ -354,24 +406,17 @@ export function updateFreebuffAccountFromPty(event: FreebuffPtyEvent): void {
   const buffered = `${terminalBySession.get(event.sessionId) ?? ""}${event.data}`;
   const terminal = visibleTerminalText(buffered.slice(-MAX_TERMINAL_CHARS));
   terminalBySession.set(event.sessionId, terminal);
+  applyTerminalRead(event.sessionId, terminal);
+}
+
+function applyTerminalRead(sessionId: string, terminal: string): void {
   const pickerModels = parseFreebuffModelPicker(terminal);
   const booted = /enter a coding task|for commands/i.test(terminal);
   const openedPicker = /choose model|esc cancel/i.test(terminal);
   const read = parseFreebuffUsageScreen(terminal);
   const hasObservedFacts = Boolean(read.dailyHours || read.sessionLeftMinutes != null || read.context || read.model || read.signedOut || read.balanceUnavailable);
   if (!booted && !openedPicker && !hasObservedFacts) return;
-  if (import.meta.env.DEV) {
-    console.debug("[Freebuff PTY screen]", {
-      frameChars: event.data.length,
-      bufferedChars: terminal.length,
-      bootMarker: booted,
-      modelPicker: openedPicker,
-      model: read.model != null,
-      context: read.context != null,
-      hourlyBalance: read.dailyHours != null,
-      sessionTime: read.sessionLeftMinutes != null,
-    });
-  }
+  if (read.model) sessionModels.set(sessionId, read.model);
   const checkedAt = Date.now();
   const fresh = freebuffSnapshotFromProbe({ boot: terminal, picker: openedPicker ? terminal : undefined, version: snapshot.version.value, booted, checkedAt });
   const unavailable = <T>(reason: string) => observed<T>("unknown", null, reason, checkedAt);
@@ -426,6 +471,8 @@ export function resetFreebuffAccountForTests(): void {
   listeners.clear();
   snapshot = initialSnapshot();
   terminalBySession.clear();
+  screenSessions.clear();
+  sessionModels.clear();
   lastProbeAt = 0;
   inflight = null;
 }

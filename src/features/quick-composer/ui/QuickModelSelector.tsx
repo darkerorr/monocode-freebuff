@@ -40,7 +40,6 @@ import {
   getActiveFreebuffSessionId,
   listFreebuffModels,
   selectFreebuffModel,
-  startFreebuffSession,
 } from "../../../integrations/harness/providers/freebuff/freebuff";
 import {
   filterQuickModels,
@@ -112,31 +111,26 @@ export function QuickModelSelector({
       : modelsFor(visibleTab);
   const models = filterQuickModels(pool, query);
   const refreshFreebuffModels = useCallback(() => {
-    const requestSessionId = preferredSessionId ?? getActiveFreebuffSessionId();
-    const targetSessionId = requestSessionId ?? (cwd ? crypto.randomUUID() : null);
+    // Only read the models of a Freebuff terminal that already belongs to a
+    // session in this project. The quick composer never starts one: the
+    // session it launches gets its own terminal, so a terminal started here
+    // would be a second, orphaned Freebuff process.
+    const targetSessionId = preferredSessionId
+      ? getActiveFreebuffSessionId(preferredSessionId)
+      : getActiveFreebuffSessionId(undefined, cwd);
     setFreebuffModelError(null);
     setFreebuffListError(null);
     setFreebuffModels(null);
     if (!targetSessionId) {
-      setFreebuffSessionId(null);        setFreebuffListError("No active Freebuff session. Open the picker from a project session to start one and read its /model choices.");
-        return;
-
+      setFreebuffSessionId(null);
+      setFreebuffListError(
+        "Freebuff starts with the model it used last. Its model list appears once the session is running; change it from the session's model picker.",
+      );
+      return;
     }
     setFreebuffSessionId(targetSessionId);
     setFreebuffListLoading(true);
-    const start = requestSessionId && !cwd
-      ? Promise.resolve()
-      : cwd
-        ? startFreebuffSession({
-          sessionId: targetSessionId,
-          cwd,
-          model: FREEBUFF_SESSION_MODEL.id,
-          runtimeMode: "supervised",
-          onEvent: () => undefined,
-        })
-        : Promise.reject(new Error("Select a project before starting Freebuff."));
-    void start
-      .then(() => listFreebuffModels(targetSessionId))
+    void listFreebuffModels(targetSessionId)
       .then(setFreebuffModels)
       .catch((error: unknown) => setFreebuffListError(error instanceof Error ? error.message : String(error)))
       .finally(() => setFreebuffListLoading(false));

@@ -220,7 +220,7 @@ it("loads real Freebuff choices from the PTY and selects them without leaving th
   expect(onChange).toHaveBeenCalledWith(FREEBUFF_SESSION_MODEL);
 });
 
-it("shows a clear no-session error instead of claiming the model list was loaded", async () => {
+it("explains where the model list comes from instead of starting a throwaway Freebuff", async () => {
   freebuffControl.getActiveFreebuffSessionId.mockReturnValue(null);
   await act(async () => {
     root.render(createElement(QuickModelSelector, {
@@ -230,11 +230,14 @@ it("shows a clear no-session error instead of claiming the model list was loaded
       onChange,
       onSettingsChange,
       onClose,
+      cwd: "C:\\work\\shop",
     }));
     container.querySelector<HTMLButtonElement>('[role="tab"][aria-label="Freebuff"]')!.click();
     await Promise.resolve();
   });
-  expect(container.textContent).toContain("No active Freebuff session.");
+  expect(container.textContent).toContain("Its model list appears once the session is running");
+  // Only a terminal in this project may be read; none is started here.
+  expect(freebuffControl.getActiveFreebuffSessionId).toHaveBeenCalledWith(undefined, "C:\\work\\shop");
   expect(freebuffControl.listFreebuffModels).not.toHaveBeenCalled();
 });
 

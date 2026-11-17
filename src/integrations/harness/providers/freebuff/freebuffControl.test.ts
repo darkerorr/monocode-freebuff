@@ -1,5 +1,11 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { FreebuffChatSnapshot } from "../../core/child";
+import type { HarnessEvent } from "../../core/types";
+import {
+  getFreebuffSessionModel,
+  resetFreebuffAccountForTests,
+} from "../../../../features/providers/model/freebuffAccount";
+import { stripFreebuffAnsi } from "./freebuffProtocol";
 import {
   resetFreebuffForTests,
   getActiveFreebuffSessionId,
@@ -38,6 +44,7 @@ function makeRuntime(): {
   let active = "DeepSeek V4.1 Flash 10/17";
   let highlighted = active;
   let pickerOpen = false;
+  let typedModelCommand = false;
   const writes: string[] = [];
   const emit = (text: string) => {
     output += text;
@@ -54,6 +61,13 @@ function makeRuntime(): {
     write: async (_session, data) => {
       writes.push(data);
       if (data === "/model\r") {
+        // Real Freebuff swallows an Enter sent in the same burst as the command.
+        emit("\r\n│  /model│");
+      } else if (data === "/model") {
+        typedModelCommand = true;
+        emit("\r\n│  /model│");
+      } else if (data === "\r" && typedModelCommand && !pickerOpen) {
+        typedModelCommand = false;
         pickerOpen = true;
         highlighted = active;
         emit(selectedPicker(active));
@@ -91,6 +105,7 @@ function makeRuntime(): {
 afterEach(async () => {
   await stopFreebuffSession("freebuff-control-session").catch(() => undefined);
   resetFreebuffForTests();
+  resetFreebuffAccountForTests();
 });
 
 describe("Freebuff interactive model control", () => {
@@ -140,7 +155,9 @@ describe("Freebuff interactive model control", () => {
     await expect(
       selectFreebuffModel("freebuff-control-session", "MiMo v2.6 Flash Slow"),
     ).resolves.toBeUndefined();
-    expect(probe.writes).toContain("/model\r");
+    // The command and its Enter go out separately; Freebuff drops a joined one.
+    expect(probe.writes).toContain("/model");
+    expect(probe.writes).not.toContain("/model\r");
     expect(probe.writes).toContain("\u001b[B");
     expect(probe.writes).toContain("\r");
     expect(probe.getOutput()).toContain("MiMo v2.6 Flash Slow • max");
@@ -163,7 +180,7 @@ describe("Freebuff interactive model control", () => {
       { name: "DeepSeek V4.1 Flash 10/17", effort: "max", descriptors: ["Smart & Fast", "Images"], selected: true },
       { name: "MiMo v2.6 Flash Slow", effort: null, descriptors: ["Slow", "cheapest", "Images"], selected: false },
     ]);
-    expect(probe.writes).toContain("/model\r");
+    expect(probe.writes).toContain("/model");
     expect(probe.writes).toContain("\u001b");
     expect(probe.getActive()).toBe("DeepSeek V4.1 Flash 10/17");
     expect(await getActiveFreebuffModel("freebuff-control-session")).toEqual({
@@ -187,11 +204,185 @@ describe("Freebuff interactive model control", () => {
     await expect(
       selectFreebuffModel("freebuff-control-session", "Not in the picker"),
     ).rejects.toThrow("does not currently offer");
-    expect(probe.writes).not.toContain("\r");
+    // One Enter opened the picker; none confirmed a model.
+    expect(probe.writes.filter((write) => write === "\r")).toHaveLength(1);
+    expect(probe.getActive()).toBe("DeepSeek V4.1 Flash 10/17");
   });
 
   it("fails closed when the session is not running", async () => {
     await expect(selectFreebuffModel("missing-session", "MiMo"))
       .rejects.toThrow("Start this Freebuff session");
+  });
+});
+
+/**
+ * Windows ConPTY sends only the cells that changed and positions them with
+ * cursor moves, so the raw stream with escapes stripped glues or drops
+ * letters. These frames reproduce that shape: each word lands at an explicit
+ * column, and nothing but the emulated screen holds the full sentence.
+ */
+function conptyLine(row: number, words: string[]): string {
+  let column = 2;
+  return words
+    .map((word) => {
+      const piece = `\u001b[${row};${column}H${word}`;
+      column += word.length + 1;
+      return piece;
+    })
+    .join("");
+}
+
+const CONPTY_BOOT = `\u001b[2J${conptyLine(20, ["Enter", "a", "coding", "task", "or", "/", "for", "commands"])}`;
+const CONPTY_FOOTER = conptyLine(23, [
+  "DeepSeek", "V4.1", "Flash", "Fast", "•", "max", "·", "~\\repo", "·", "/model", "to", "change",
+]) + conptyLine(24, ["12m", "left", "·", "15.8K", "(2%)"]);
+
+function conptyRuntime(chat: () => FreebuffChatSnapshot = () => emptyChat): {
+  runtime: FreebuffRuntime;
+  writes: string[];
+  emit: (text: string) => void;
+} {
+  const handlers = new Map<string, (data: string) => void>();
+  const writes: string[] = [];
+  let current: string | null = null;
+  const emit = (text: string) => {
+    if (current) handlers.get(current)?.(text);
+  };
+  return {
+    writes,
+    emit,
+    runtime: {
+      resolveBinary: async () => ({ path: "C:\\npm\\freebuff.cmd" }),
+      prepareChat: async (_cwd, chatId) => ({ path: `/chat/${chatId}`, created: true }),
+      readChat: async () => chat(),
+      spawn: async ({ sessionId }) => {
+        current = sessionId;
+        emit(CONPTY_BOOT + CONPTY_FOOTER);
+        return 91;
+      },
+      write: async (sessionId, data) => {
+        writes.push(data);
+        current = sessionId;
+      },
+      kill: async () => undefined,
+      watch: (sessionId, onData) => {
+        handlers.set(sessionId, onData);
+      },
+      unwatch: (sessionId) => {
+        handlers.delete(sessionId);
+      },
+      delay: async () => {
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      },
+      now: () => Date.now(),
+    },
+  };
+}
+
+const SCREEN_PUBLISH_WAIT_MS = 320;
+
+describe("Freebuff on a Windows ConPTY screen", () => {
+  it("detects the prompt from the rendered screen when the raw stream glues words", async () => {
+    expect(stripFreebuffAnsi(CONPTY_BOOT)).not.toMatch(/enter a coding task|for commands/i);
+    const probe = conptyRuntime();
+    setFreebuffRuntimeForTests(probe.runtime);
+
+    await startFreebuffSession({
+      sessionId: "freebuff-control-session",
+      cwd: "C:\\repo",
+      model: "freebuff:session",
+      runtimeMode: "supervised",
+      onEvent: () => undefined,
+    });
+
+    expect(getActiveFreebuffSessionId("freebuff-control-session")).toBe("freebuff-control-session");
+  });
+
+  it("shows the session's model and Freebuff's context from the footer", async () => {
+    const probe = conptyRuntime();
+    setFreebuffRuntimeForTests(probe.runtime);
+    const input = {
+      sessionId: "freebuff-control-session",
+      cwd: "C:\\repo",
+      model: "freebuff:session",
+      runtimeMode: "supervised" as const,
+      onEvent: () => undefined,
+    };
+    await startFreebuffSession(input);
+    await new Promise((resolve) => setTimeout(resolve, SCREEN_PUBLISH_WAIT_MS));
+
+    expect(getFreebuffSessionModel(input.sessionId)).toEqual({
+      name: "DeepSeek V4.1 Flash Fast",
+      effort: "max",
+    });
+    const events: HarnessEvent[] = [];
+    await sendFreebuffTurn({ ...input, text: "", onEvent: (event) => events.push(event) });
+    expect(events).toContainEqual({ type: "context", used: 15_800, window: 790_000 });
+
+    await stopFreebuffSession(input.sessionId);
+    expect(getFreebuffSessionModel(input.sessionId)).toBeNull();
+  });
+
+  it("submits a prompt the rendered composer shows, with an accented first line", async () => {
+    let submitted = false;
+    const probe = conptyRuntime(() =>
+      submitted
+        ? {
+            size: 3,
+            mtimeMs: 2,
+            messages: [
+              { id: "u1", variant: "user", content: "Corrige l'élément", blocks: [] },
+              {
+                id: "a1",
+                variant: "ai",
+                content: "",
+                isComplete: true,
+                blocks: [{ type: "text", textType: "text", content: "C'est corrigé." }],
+              },
+            ],
+          }
+        : emptyChat,
+    );
+    const write = probe.runtime.write;
+    probe.runtime.write = async (sessionId, data) => {
+      await write(sessionId, data);
+      if (data.startsWith("\u001b[200~")) {
+        probe.emit(conptyLine(21, ["Corrige", "l'élément", "du", "panneau"]));
+      } else if (data === "\r") {
+        submitted = true;
+      }
+    };
+    setFreebuffRuntimeForTests(probe.runtime);
+    const events: HarnessEvent[] = [];
+
+    await sendFreebuffTurn({
+      sessionId: "freebuff-control-session",
+      cwd: "C:\\repo",
+      model: "freebuff:session",
+      runtimeMode: "supervised",
+      text: "Corrige l'élément du panneau",
+      onEvent: (event) => events.push(event),
+    });
+
+    expect(probe.writes).toContain("\r");
+    expect(events).toContainEqual({ type: "message.delta", text: "C'est corrigé." });
+    expect(events).toContainEqual({ type: "message.completed" });
+    expect(getActiveFreebuffSessionId("freebuff-control-session")).toBe("freebuff-control-session");
+  });
+
+  it("never hands a picker another project's Freebuff terminal", async () => {
+    setFreebuffRuntimeForTests(conptyRuntime().runtime);
+    await startFreebuffSession({
+      sessionId: "freebuff-control-session",
+      cwd: "C:\\project-a",
+      model: "freebuff:session",
+      runtimeMode: "supervised",
+      onEvent: () => undefined,
+    });
+
+    expect(getActiveFreebuffSessionId(undefined, "C:\\project-a")).toBe("freebuff-control-session");
+    expect(getActiveFreebuffSessionId(undefined, "C:\\project-b")).toBeNull();
+    // A named session that is not running is not swapped for another one.
+    expect(getActiveFreebuffSessionId("some-other-session")).toBeNull();
   });
 });
